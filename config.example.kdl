@@ -1,0 +1,33 @@
+// Example focus-event config. KDL-like syntax.
+//
+// Top-level nodes are rules. Each rule is either `on-focus` (fires when a
+// matching window gains focus) or `on-blur` (fires when a matching window
+// loses focus). Selectors are properties on the rule node, combined with
+// logical AND. Actions are `spawn` children.
+//
+// Selectors (all optional, repeatable-but-redundant):
+//   app-id="regex"        match against the window's app_id
+//   title="regex"         match against the window's title
+//   id=42                 match a specific numeric window id
+//   workspace-id=3        match windows on the given workspace
+//   is-floating=true      match floating (or tiled) windows
+//   is-urgent=true        match urgent (or non-urgent) windows
+//
+// `app-id` and `title` are regexes; the regex matches if it appears anywhere
+// in the value (use ^...$ to anchor).
+//
+// Example: mute audio when focusing the VSCodium window editing this project,
+// unmute when focusing anything else.
+
+on-focus app-id="codium" title="focus-event" {
+    spawn "pactl" "set-sink-mute" "@DEFAULT_SINK@" "1"
+}
+
+on-blur app-id="codium" title="focus-event" {
+    spawn "pactl" "set-sink-mute" "@DEFAULT_SINK@" "0"
+}
+
+// Example: a desktop notification whenever Wechat gains focus.
+// on-focus app-id="wechat" {
+//     spawn "notify-send" "WeChat focused"
+// }

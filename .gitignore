@@ -1,0 +1,10 @@
+build/
+.cache/
+test/
+compile_commands.json
+*.o
+*.a
+*.so
+result
+result-*
+*example*

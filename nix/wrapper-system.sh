@@ -43,4 +43,12 @@ fi
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 export NIRI_SOCKET="$SOCKET"
 
+# System-level services start with a minimal PATH that does not include the
+# target user's profile directory. On NixOS, user-installed packages (via
+# Home Manager or `users.users.<n>.packages`) land in
+# /etc/profiles/per-user/<user>/bin, which is where `niri` typically lives.
+# Prepend it (plus the system wrapper dir and the current PATH) so the daemon
+# and its `niri msg` subprocesses can find the binary.
+export PATH="/etc/profiles/per-user/$USERNAME_ARG/bin:/run/wrappers/bin:$PATH"
+
 exec "$@"

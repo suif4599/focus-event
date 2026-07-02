@@ -98,14 +98,47 @@ std::string run_capture_stdout(const std::vector<std::string>& argv) {
 
 pid_t spawn_detached(const std::vector<std::string>& argv) {
     if (argv.empty()) return -1;
-    pid_t pid = ::fork();
-    if (pid < 0) return -1;
-    if (pid > 0) return pid;
 
-    // child
+    // Double-fork so the actual command is reparented to PID 1 (or the
+    // subreaper). The immediate child exits immediately, which lets us reap it
+    // synchronously here; the grandchild outlives us and never becomes a
+    // zombie we own. This avoids the need for a SIGCHLD handler that would
+    // race with the synchronous waitpid() in run_capture_stdout().
+    int syncpipe[2];
+    if (::pipe2(syncpipe, O_CLOEXEC) < 0) return -1;
+
+    pid_t pid = ::fork();
+    if (pid < 0) { ::close(syncpipe[0]); ::close(syncpipe[1]); return -1; }
+    if (pid > 0) {
+        // Parent: close write end, wait for immediate child to exit, then
+        // read the grandchild's pid back through the pipe.
+        ::close(syncpipe[1]);
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+        pid_t grandpid = -1;
+        ssize_t n = ::read(syncpipe[0], &grandpid, sizeof(grandpid));
+        (void)n;
+        ::close(syncpipe[0]);
+        return grandpid;
+    }
+
+    // First child.
     if (::setsid() < 0) ::_exit(127);
 
-    // Detach stdio from our terminal.
+    pid_t grandpid = ::fork();
+    if (grandpid < 0) ::_exit(127);
+    if (grandpid > 0) {
+        // Write the grandchild's pid back to the parent, then exit.
+        ssize_t w = ::write(syncpipe[1], &grandpid, sizeof(grandpid));
+        (void)w;
+        ::close(syncpipe[1]);
+        ::_exit(0);
+    }
+
+    // Grandchild: detach stdio and exec.
+    ::close(syncpipe[0]);
+    ::close(syncpipe[1]);
+
     int devnull_in = ::open("/dev/null", O_RDONLY);
     int devnull_out = ::open("/dev/null", O_WRONLY);
     if (devnull_in >= 0) { ::dup2(devnull_in, STDIN_FILENO); ::close(devnull_in); }

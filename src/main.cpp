@@ -83,22 +83,15 @@ bool drain_lines(int fd, std::string& buf, std::function<void(std::string_view)>
     }
 }
 
-void install_sigchld_reaper() {
-    // Auto-reap children so spawn_detached and the long-running niri msg child
-    // don't become zombies. We never block on waitpid for the spawn actions;
-    // they're fire-and-forget.
-    struct sigaction sa{};
-    sa.sa_handler = [](int) {
-        int saved = errno;
-        while (::waitpid(-1, nullptr, WNOHANG) > 0) {
-            // spin
-        }
-        errno = saved;
-    };
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    ::sigaction(SIGCHLD, &sa, nullptr);
-}
+// We deliberately do NOT install a SIGCHLD reaper. Such a handler would race
+// with the synchronous waitpid() inside subprocess::run_capture_stdout()
+// (which Engine::refresh_from_niri() calls on cache misses), causing
+// "waitpid: No child processes" (ECHILD) errors. Instead:
+//   - subprocess::run_capture_stdout() and launch_pipe_stdout() reap their
+//     own children explicitly.
+//   - subprocess::spawn_detached() double-forks so the actual command is
+//     reparented to PID 1, which reaps it for free.
+//   - main() reaps the long-running niri-msg child when its stream closes.
 
 } // namespace
 
@@ -130,8 +123,6 @@ int main(int argc, char** argv) {
     std::cerr << "focus-event: loaded " << cfg.rules.size() << " rule(s) from "
               << config_path << "\n";
 
-    install_sigchld_reaper();
-
     engine::Engine eng(std::move(cfg));
     try {
         eng.bootstrap();
@@ -157,6 +148,7 @@ int main(int argc, char** argv) {
 
     epoll::Loop loop;
     std::string line_buf;
+    bool stream_failed = false;
     loop.add(pipe.read_fd, [&](int fd) {
         bool ok = drain_lines(fd, line_buf, [&](std::string_view line) {
             if (line.empty()) return;
@@ -164,7 +156,14 @@ int main(int argc, char** argv) {
             eng.handle_event(ev);
         });
         if (!ok) {
-            std::cerr << "focus-event: niri event stream closed, exiting\n";
+            // Treat premature EOF as a failure so systemd's Restart=on-failure
+            // kicks in. niri msg normally runs forever; EOF means either niri
+            // crashed, our IPC was rejected, or `niri msg` couldn't even start
+            // (missing PATH, socket vanished, etc.). Returning non-zero lets
+            // the unit cycle back to a clean state once niri is reachable
+            // again instead of silently going inactive.
+            std::cerr << "focus-event: niri event stream closed unexpectedly\n";
+            stream_failed = true;
             loop.stop();
         }
     });
@@ -173,9 +172,18 @@ int main(int argc, char** argv) {
         loop.run();
     } catch (const std::exception& e) {
         std::cerr << "focus-event: epoll loop error: " << e.what() << "\n";
+        ::close(pipe.read_fd);
         return 1;
     }
 
     ::close(pipe.read_fd);
-    return 0;
+
+    // Reap the long-running niri-msg child. We didn't waitpid it earlier
+    // because the loop only exits on EOF or stop(); now we own it again.
+    if (pipe.pid > 0) {
+        int status = 0;
+        while (::waitpid(pipe.pid, &status, 0) < 0 && errno == EINTR) { }
+    }
+
+    return stream_failed ? 1 : 0;
 }

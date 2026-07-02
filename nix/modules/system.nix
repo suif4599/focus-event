@@ -74,12 +74,22 @@ in
   config = lib.mkIf cfg.enable {
     systemd.services.focus-event = {
       description = "focus-event: react to niri window focus changes (system-level, talks to a user's niri)";
-      after = [ "graphical.target" ];
-      wants = [ "graphical.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      # The unit may come up before the user has logged in or before niri has
-      # created its socket. Restart gently so we attach as soon as possible.
+      # NOTE: do NOT add `after = [ "graphical.target" ]` here. Doing so creates
+      # an ordering cycle: multi-user.target wants us, we want graphical.target,
+      # graphical.target requires multi-user.target. systemd will refuse to
+      # start graphical.target with "Transaction order is cyclic".
+      #
+      # Instead we let the unit start early (at multi-user.target time) and
+      # rely on the wrapper script + Restart=on-failure to keep retrying every
+      # RestartSec until the user logs in and niri creates its socket.
+
+      # The user might not be logged in (or niri not yet up) when the unit
+      # first starts. Disable systemd's default 5-burst-in-10s start limit so
+      # we keep retrying indefinitely instead of giving up.
+      startLimitIntervalSec = 0;
+
       serviceConfig = {
         Type = "simple";
         ExecStart = "${launcher}/bin/focus-event-system-launch ${lib.escapeShellArg cfg.user} ${pkgs.focus-event}/bin/focus-event --config ${kdlConfig}";

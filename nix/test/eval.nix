@@ -1,5 +1,5 @@
-# Test harness: import the user module into a minimal NixOS config and
-# verify the systemd user unit + systemd.packages evals without error.
+# Test harness: import the focus-event module into a minimal NixOS config and
+# verify both the systemd service and the wrapper eval without error.
 { system ? builtins.currentSystem }:
 
 let
@@ -10,15 +10,18 @@ nixpkgsSrc.lib.nixosSystem {
   inherit system;
   modules = [
     "${nixpkgsSrc}/nixos/modules/virtualisation/qemu-vm.nix"
-    flake.nixosModules.user
+    flake.nixosModules.default
     {
       users.users.alice = { isNormalUser = true; password = "x"; };
 
-      services.focus-event-user = {
+      services.focus-event = {
         enable = true;
+        allowedUsers = [ "alice" ];
         rules = [
-          { trigger = "focus"; app-id = "codium";
+          { trigger = "focus"; app-id = "codium"; title = ".*focus-event.*";
             spawn = [ [ "pactl" "set-sink-mute" "@DEFAULT_SINK@" "1" ] ]; }
+          { trigger = "blur"; app-id = "codium";
+            spawn = [ [ "pactl" "set-sink-mute" "@DEFAULT_SINK@" "0" ] ]; }
         ];
       };
 

@@ -17,21 +17,34 @@ add_compile_options(
     -O2
 )
 
-add_executable(focus-event
-    src/main.cpp
-    src/kdl.cpp
-    src/config.cpp
-    src/niri.cpp
-    src/epoll.cpp
-    src/subprocess.cpp
-    src/engine.cpp
+# Shared static library with all the engine internals: KDL parser, niri JSON
+# codec, epoll wrapper, subprocess helpers, UDS framing, rule engine.
+add_library(focus-event-lib STATIC
+    src/lib/kdl.cpp
+    src/lib/config.cpp
+    src/lib/niri.cpp
+    src/lib/epoll.cpp
+    src/lib/subprocess.cpp
+    src/lib/uds.cpp
+    src/lib/engine.cpp
 )
-
-target_include_directories(focus-event PRIVATE
+target_include_directories(focus-event-lib PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
 )
 
-target_link_libraries(focus-event PRIVATE)
+# The privileged system service: listens on a UDS, fork+setsid+execs commands
+# from peers it has cleared via SO_PEERCRED.
+add_executable(focus-event-executor
+    src/executor_main.cpp
+)
+target_link_libraries(focus-event-executor PRIVATE focus-event-lib)
 
-install(TARGETS focus-event RUNTIME DESTINATION bin)
+# The user-space half: spawned by niri, reads config + event-stream, sends
+# SPAWN frames to the executor over UDS.
+add_executable(focus-event-trigger
+    src/trigger_main.cpp
+)
+target_link_libraries(focus-event-trigger PRIVATE focus-event-lib)
+
+install(TARGETS focus-event-executor focus-event-trigger RUNTIME DESTINATION bin)

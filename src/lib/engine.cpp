@@ -7,6 +7,12 @@
 
 namespace engine {
 
+void LocalSpawner::spawn(const std::vector<std::string>& argv) {
+    if (subprocess::spawn_detached(argv) < 0) {
+        std::cerr << "focus-event: local spawn failed for `" << argv[0] << "`\n";
+    }
+}
+
 namespace {
 
 std::vector<std::string> niri_windows_argv() {
@@ -15,11 +21,11 @@ std::vector<std::string> niri_windows_argv() {
 
 } // namespace
 
-Engine::Engine(config::Config cfg) : cfg_(std::move(cfg)) {}
+Engine::Engine(config::Config cfg, Spawner& spawner)
+    : cfg_(std::move(cfg)), spawner_(spawner) {}
 
 void Engine::bootstrap() {
     refresh_from_niri();
-    // Seed last_focused_id_ from whatever window the cache says is focused.
     for (const auto& [_, w] : cache_) {
         if (w.is_focused) {
             last_focused_id_ = w.id;
@@ -51,26 +57,19 @@ void Engine::refresh_from_niri() {
 std::optional<niri::Window> Engine::resolve(uint64_t id) {
     auto it = cache_.find(id);
     if (it != cache_.end()) return it->second;
-    // Miss — refresh once and try again.
     refresh_from_niri();
     it = cache_.find(id);
     if (it != cache_.end()) return it->second;
     return std::nullopt;
 }
 
-void Engine::run_actions(const std::vector<config::SpawnAction>& actions) {
-    for (const auto& act : actions) {
-        if (subprocess::spawn_detached(act.argv) < 0) {
-            std::cerr << "focus-event: spawn failed for `" << act.argv[0] << "`\n";
-        }
-    }
-}
-
 void Engine::fire_rules(config::Trigger t, const niri::Window& w) {
     for (const auto& rule : cfg_.rules) {
         if (rule.trigger != t) continue;
         if (config::matches(rule.selectors, w)) {
-            run_actions(rule.actions);
+            for (const auto& act : rule.actions) {
+                spawner_.spawn(act.argv);
+            }
         }
     }
 }
@@ -78,16 +77,12 @@ void Engine::fire_rules(config::Trigger t, const niri::Window& w) {
 void Engine::handle_event(const niri::Event& ev) {
     switch (ev.kind) {
         case niri::Event::WindowOpenedOrChanged: {
-            if (ev.window) {
-                cache_[ev.window->id] = *ev.window;
-            }
+            if (ev.window) cache_[ev.window->id] = *ev.window;
             break;
         }
         case niri::Event::WindowClosed: {
             if (ev.closed_id) cache_.erase(*ev.closed_id);
-            // If the closed window was the last focused one, treat as blur.
             if (ev.closed_id && last_focused_id_ == ev.closed_id) {
-                // We don't have window info anymore; skip firing blur for it.
                 last_focused_id_.reset();
             }
             break;
@@ -100,16 +95,11 @@ void Engine::handle_event(const niri::Event& ev) {
         case niri::Event::WindowFocusChanged: {
             std::optional<uint64_t> new_id = ev.focused_id;
             std::optional<uint64_t> old_id = last_focused_id_;
-
-            // Skip no-op re-focuses (same id reported twice in a row).
             if (old_id == new_id) break;
-
-            // Fire blur on the previously focused window (if any).
             if (old_id) {
                 auto prev = resolve(*old_id);
                 if (prev) fire_rules(config::Trigger::Blur, *prev);
             }
-            // Fire focus on the new window (if any).
             if (new_id) {
                 auto cur = resolve(*new_id);
                 if (cur) fire_rules(config::Trigger::Focus, *cur);

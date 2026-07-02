@@ -1,23 +1,45 @@
 # focus-event
 
-A tiny daemon that watches the running [niri](https://github.com/YaLTeR/niri)
-compositor's event stream and runs configured commands when windows gain or
-lose keyboard focus. Built in C++20 on top of `epoll`, with zero polling and a
-self-maintained window-info cache.
+React to [niri](https://github.com/YaLTeR/niri) window focus changes by running
+configured commands. Built as a split daemon:
 
-The flake ships:
+- **`focus-event-executor`** — a privileged system service that listens on a
+  Unix domain socket and fork+execs commands. Validates each connecting peer
+  via `SO_PEERCRED` against an optional uid/username allowlist.
+- **`focus-event-trigger`** — a user-space process spawned by niri (via niri's
+  `spawn-at-startup`). Reads the niri event stream, matches windows against
+  the rule table, and forwards SPAWN commands to the executor over the socket.
 
-- `packages.<system>.default` — the bare binary, for non-NixOS use
-- `nixosModules.system` — system-level systemd service (runs as root, talks to
-  a chosen user's niri via runtime uid lookup + `NIRI_SOCKET` globbing)
-- `nixosModules.user` — user-level systemd service (runs as the logged-in user,
-  inherits their env)
-- `lib.renderConfig` — pure-Nix KDL renderer for the structured `rules` options
-- `overlays.default` — adds `pkgs.focus-event` to your pkgs
+The split lets focus changes drive privileged actions (e.g. `keyd`, system
+`pactl`) without ever running the rule engine as root. The trigger inherits
+the user's environment naturally — `XDG_RUNTIME_DIR`, `NIRI_SOCKET`, `PATH` —
+so there's no uid-resolution dance or PATH munging like there'd be with a
+single system service.
+
+## Architecture
+
+```
+ User session (niri)                                System (root)
+ ┌────────────────────────────────┐                 ┌────────────────────────────┐
+ │  niri                          │                 │  focus-event-executor      │
+ │   └─ spawn-at-startup          │                 │   listens on               │
+ │       └─ focus-event-trigger   │                 │   /run/focus-event/sock    │
+ │            │                   │                 │   ↓ per conn: SO_PEERCRED  │
+ │            │ event-stream      │                 │   ↓ allowlist check        │
+ │            ▼                   │   UDS frames    │                            │
+ │     rule engine + cache  ──────┼─────────────────┼─► SPAWN argv → fork+setsid │
+ │            │                   │                 │   ↓                        │
+ │            ▼ config (KDL)      │                 │   privileged command runs │
+ └────────────────────────────────┘                 └────────────────────────────┘
+```
+
+The protocol is length-prefixed binary frames over a Unix domain socket. See
+[src/lib/protocol.hpp](src/lib/protocol.hpp). Two tags exist: `h` (hello, so
+the executor's logs read nicer) and `s` (spawn — argc + length-prefixed argv).
 
 ## Quick start (NixOS)
 
-Add the flake and pick a module:
+Add the flake and enable the module:
 
 ```nix
 {
@@ -27,21 +49,22 @@ Add the flake and pick a module:
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        focus-event.nixosModules.user   # or .system
+        focus-event.nixosModules.default
         {
-          services.focus-event-user = {
+          services.focus-event = {
             enable = true;
+            allowedUsers = [ "alice" ];
             rules = [
               {
                 trigger = "focus";
                 app-id = "codium";
                 title = ".*focus-event.*";
-                spawn = [ [ "pactl" "set-sink-mute" "@DEFAULT_SINK@" "1" ] ];
+                spawn = [ [ "keyd" "bind" "control.j = C-S-tab" ] ];
               }
               {
                 trigger = "blur";
                 app-id = "codium";
-                spawn = [ [ "pactl" "set-sink-mute" "@DEFAULT_SINK@" "0" ] ];
+                spawn = [ [ "keyd" "unbind" ] ];
               }
             ];
           };
@@ -52,59 +75,30 @@ Add the flake and pick a module:
 }
 ```
 
-For the **system** module, you must also specify which user's niri to talk to:
+Then in your niri config:
 
-```nix
-services.focus-event-system = {
-  enable = true;
-  user = "alice";
-  rules = [ /* ... */ ];
-};
+```kdl
+spawn-at-startup "focus-event"
 ```
 
-## Two flavours
+That's the entire user-facing surface. The module:
 
-### `nixosModules.user` — per-user service
-
-Installs a systemd **user** unit at `/etc/systemd/user/focus-event.service`
-(via `systemd.packages`). The unit inherits the user's environment —
-`XDG_RUNTIME_DIR`, `NIRI_SOCKET`, `WAYLAND_DISPLAY`, etc. — so no env munging
-is required. After `nixos-rebuild switch`, enable it once per user:
-
-```sh
-systemctl --user enable --now focus-event.service
-```
-
-The unit binds into `graphical-session.target` so it starts with the user's
-Wayland session.
-
-### `nixosModules.system` — system service
-
-Installs a regular `systemd.services.focus-event` that runs as root at boot.
-Because root doesn't have the user's env, the unit's `ExecStart` is wrapped by
-[`nix/wrapper-system.sh`](nix/wrapper-system.sh), which:
-
-1. Resolves the runtime uid via `id -u <user>` (NixOS may assign uids lazily —
-   the wrapper tolerates this by deferring lookup to start time)
-2. Globs `/run/user/<uid>/niri.wayland-*.sock` to find the running niri's IPC
-   socket (the PID-suffixed name is not known at nixos-rebuild time)
-3. Exports `XDG_RUNTIME_DIR` and `NIRI_SOCKET`
-4. Execs the focus-event binary
-
-If the user isn't logged in yet or niri isn't up, the wrapper exits non-zero
-and systemd retries with `Restart=on-failure`, `RestartSec=5s`.
+1. Renders `services.focus-event.rules` into a KDL file in the nix store.
+2. Installs a `focus-event` wrapper script (in `environment.systemPackages`)
+   that invokes `focus-event-trigger --config <rendered.kdl> --socket
+   /run/focus-event/sock`.
+3. Starts `systemd.services.focus-event` (the executor) at boot, with
+   `RuntimeDirectory=focus-event` so `/run/focus-event/` exists and is cleaned
+   up across restarts.
 
 ## Options
 
-Both modules share the same rule schema; only the system module additionally
-requires `user`.
-
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enable` | bool | `false` | Enable the module. |
-| `user` | string | *(system: required)* | Username whose niri to talk to (system module only). |
-| `rules` | list of submodule | `[]` | Structured rules; rendered to KDL. |
-| `extraConfig` | lines | `""` | Raw KDL appended after generated rules (escape hatch). |
+| `enable` | bool | `false` | Enable the executor service and install the trigger wrapper. |
+| `rules` | list of submodule | `[]` | Structured rules → rendered into the KDL config the trigger reads. |
+| `extraConfig` | lines | `""` | Raw KDL appended after the generated rules (escape hatch). |
+| `allowedUsers` | list of str | `[]` | Usernames allowed to connect to the executor. Resolved at runtime via `getpwnam`, so lazy-uid NixOS accounts work. Empty = allow any local uid (audit-logged via `SO_PEERCRED` only). |
 
 Each rule submodule:
 
@@ -117,15 +111,52 @@ Each rule submodule:
 | `workspace-id` | nullOr uint | `null` | Match windows on this workspace. |
 | `is-floating` | nullOr bool | `null` | Match floating (true) or tiled (false). |
 | `is-urgent` | nullOr bool | `null` | Match urgent (true) or non-urgent (false). |
-| `spawn` | list of (list of str) | `[]` | Spawn actions; each element is an argv. |
+| `spawn` | list of (list of str) | `[]` | Spawn actions; each element is an argv. Multiple actions fire in order. |
 
-Selectors within a rule are combined with logical AND. A rule with no
-selectors matches every window. Multiple spawn actions fire in declaration
-order. `on-focus` and `on-blur` both fire against the window gaining / losing
-focus — `on-blur` against the previously focused window, `on-focus` against the
-newly focused one.
+Within a rule, selectors are AND-combined. `on-blur` fires against the window
+losing focus; `on-focus` fires against the window gaining focus.
 
-## How it works
+## Security model
+
+- **Socket perms.** The executor creates the socket with mode `0660` and
+  group `root` (configurable via `--mode`). Only users with write access can
+  even attempt a connection.
+- **`SO_PEERCRED`.** On each accepted connection, the executor reads the
+  kernel-verified `{pid, uid, gid}` of the peer. If `--allow-uid N` or
+  `--allow-user NAME` was given (repeatable), connections whose uid isn't in
+  the resolved set are dropped before any frame is read. Usernames are
+  re-resolved via `getpwnam` on each connection so newly-created users work
+  without restarting the executor.
+- **Defense in depth.** The NixOS module wires `allowedUsers` into
+  `--allow-user`, but the underlying socket file mode (`0660`) is the first
+  gate. Set `allowedUsers = [ "alice" ]` for a single-user workstation; leave
+  it empty for a fully-trust-the-socket-perms setup.
+
+If a peer is rejected, the executor logs `executor: rejecting uid N pid P
+(not in allowlist)` and closes the connection without reading any frames.
+
+## Why the split?
+
+A single daemon trying to be both "user-space focus watcher" and
+"privileged spawn runner" runs into a mess of environment issues:
+
+- `NIRI_SOCKET` lives in the user's environment, but the daemon needs to be
+  privileged to spawn commands.
+- Resolving the user's uid at runtime requires a wrapper script and gives
+  systemd ordering head-aches (graphical.target cycles).
+- The daemon must duplicate the user's `PATH` to find `niri`, and any
+  spawn actions inherit the wrong environment.
+
+The split eliminates all of that:
+
+- The **trigger** is just a user process — niri spawned it, so its env is
+  complete and correct by construction.
+- The **executor** is a dumb, privileged pipe-cleaner: it doesn't know about
+  niri, windows, or rules. It just spawn()s what an authenticated peer sends.
+- The boundary is the Unix domain socket, with `SO_PEERCRED` as the
+  authentication mechanism (kernel-trusted, no spoofing possible).
+
+## How the trigger works
 
 ```
                 ┌──────────────────┐
@@ -157,30 +188,38 @@ newly focused one.
                        │
                        ▼
               ┌──────────────────────┐
-              │  spawn (setsid+exec) │  fire-and-forget, no wait
+              │  SPAWN frame → UDS   │  → executor (privileged)
               └──────────────────────┘
 ```
 
 Highlights:
 
 - **No polling.** A single `epoll_wait` blocks until the niri event-stream
-  emits a line. No timers, no sleep loops, no wakeups on idle.
-- **Cheap focus changes.** The daemon maintains an in-memory window cache
-  (`WindowOpenedOrChanged` and `WindowClosed` update it incrementally). A
-  `WindowFocusChanged` only triggers `niri msg -j windows` if its id is missing
-  from the cache — typically never after the initial bootstrap.
-- **Fire-and-forget spawns.** Action commands `fork`/`setsid`/`exec` so they
-  outlive the daemon and don't block it.
-- **Debouncing.** Repeated `WindowFocusChanged` events with the same id (niri
-  emits these around `OverviewOpenedOrClosed`) are coalesced into a single
-  focus event.
-- **KDL config.** The format mirrors niri's own config style — `on-focus` /
-  `on-blur` blocks with selector properties and `spawn` children.
+  emits a line.
+- **Cheap focus changes.** The window cache is maintained incrementally from
+  `WindowOpenedOrChanged` / `WindowClosed`. A full `niri msg -j windows`
+  refresh happens only on a cache miss (typically never after bootstrap).
+- **Debouncing.** Repeated `WindowFocusChanged` events with the same id
+  (common around overview open/close) are coalesced.
+- **Reconnect.** If the executor restarts, the trigger transparently
+  reconnects on the next spawn attempt.
+
+## Bare binaries (non-NixOS)
+
+```sh
+nix build                              # or: cmake -B build && cmake --build build
+./result/bin/focus-event-executor --socket /tmp/fe.sock --mode 0660 --allow-user "$USER" &
+./result/bin/focus-event-trigger --socket /tmp/fe.sock --config config.example.kdl
+```
+
+For local development without an executor, pass `--socket ""` to the trigger
+and it will spawn commands directly (via fork+setsid+execvp) instead of
+forwarding them. Useful for iterating on the rule engine without systemd.
 
 ## Configuration file format
 
-The NixOS modules render a structured `rules` option into KDL. If you'd rather
-write KDL directly (e.g. when running the bare binary), here's the grammar:
+The NixOS module renders a structured `rules` option into KDL. If you'd
+rather write KDL directly, here's the grammar:
 
 ```kdl
 // Comments use // or /* */.
@@ -195,20 +234,9 @@ on-blur app-id="codium" {
 }
 ```
 
-Selectors on a rule are AND-combined; absent selectors match anything.
-
-Default config path: `$XDG_CONFIG_HOME/focus-event/config.kdl`, falling back to
+Default config path for the trigger (when not invoked via the wrapper):
+`$XDG_CONFIG_HOME/focus-event/config.kdl`, falling back to
 `~/.config/focus-event/config.kdl`. Override with `--config PATH`.
-
-## Bare binary (non-NixOS)
-
-```sh
-nix build                              # or: cmake -B build && cmake --build build
-./result/bin/focus-event --config path/to/config.kdl
-```
-
-Useful when iterating on the C++ side without going through a full NixOS
-rebuild.
 
 ## Development
 
@@ -216,64 +244,43 @@ rebuild.
 nix develop                            # cmake, ninja, gcc, niri
 cmake -B build -G Ninja
 ninja -C build
-./build/focus-event --config config.example.kdl
+
+# Live test against your running niri session:
+./build/focus-event-executor --socket /tmp/fe.sock --mode 0660 --allow-user "$USER" &
+./build/focus-event-trigger --socket /tmp/fe.sock --config config.example.kdl
 ```
 
-For fast iteration against a live niri session, run the binary directly with a
-scratch config:
-
-```kdl
-on-focus { spawn "sh" "-c" "echo focus $(date) >> /tmp/fe.log" }
-on-blur  { spawn "sh" "-c" "echo blur  $(date) >> /tmp/fe.log" }
-```
-
-Switch windows a few times; `/tmp/fe.log` should accumulate one line per
-transition.
-
-## Testing the modules
-
-The flake ships two test harnesses that just check whether the modules eval
-inside a minimal `nixosSystem`:
+To validate the NixOS module evals cleanly inside a minimal `nixosSystem`:
 
 ```sh
-nix eval --impure --expr 'let cfg = (import ./nix/test/eval-system.nix) {}; in cfg.config.systemd.services.focus-event'
-nix eval --impure --expr 'let cfg = (import ./nix/test/eval-user.nix)   {}; in cfg.config.systemd.packages'
-```
-
-To manually verify the system module's wrapper can talk to your running niri
-(without going through systemd):
-
-```sh
-env -u NIRI_SOCKET -u XDG_RUNTIME_DIR \
-  ./nix/wrapper-system.sh $(whoami) ./build/focus-event --config config.example.kdl
+nix eval --impure --expr 'let cfg = (import ./nix/test/eval.nix) {}; in cfg.config.systemd.services.focus-event'
 ```
 
 ## Project layout
 
 ```
 .
-├── CMakeLists.txt             # C++20, gcc, no external deps
-├── flake.nix                  # packages, modules, lib, overlay, dev shell
+├── CMakeLists.txt             # Builds lib + executor + trigger
+├── flake.nix                  # packages, overlay, nixosModules.default, lib
 ├── config.example.kdl         # hand-written example
-├── example-events.txt         # sample event-stream lines (for offline testing)
+├── example-events.txt         # sample event-stream lines (offline testing)
 ├── example-windows.txt        # sample niri msg -j windows output
 ├── nix/
 │   ├── lib.nix                # renderConfig: rules → KDL (pure Nix)
-│   ├── wrapper-system.sh      # uid resolution + NIRI_SOCKET globbing for system module
-│   ├── modules/
-│   │   ├── system.nix         # systemd.services.focus-event
-│   │   └── user.nix           # systemd.packages with user unit
-│   └── test/
-│       ├── eval-system.nix
-│       └── eval-user.nix
+│   ├── default.nix            # the NixOS module (service + package)
+│   └── test/eval.nix          # smoke-test NixOS config
 ├── src/
-│   ├── main.cpp               # entry, SIGCHLD reaper, epoll loop, line buffer
-│   ├── kdl.{cpp,hpp}          # minimal KDL-like parser (lexer + AST)
-│   ├── config.{cpp,hpp}       # rule structs, selector matcher (regex)
-│   ├── niri.{cpp,hpp}         # event-stream + windows JSON parsing
-│   ├── epoll.{cpp,hpp}        # thin epoll wrapper
-│   ├── subprocess.{cpp,hpp}   # fork+exec helpers (pipe, capture, setsid)
-│   └── engine.{cpp,hpp}       # window cache + rule dispatch
+│   ├── lib/                   # shared static lib
+│   │   ├── kdl.{cpp,hpp}      # KDL-like parser
+│   │   ├── config.{cpp,hpp}   # rule structs + selector matcher (regex)
+│   │   ├── niri.{cpp,hpp}     # event-stream + windows JSON codec
+│   │   ├── epoll.{cpp,hpp}    # thin epoll wrapper
+│   │   ├── subprocess.{cpp,hpp} # fork+exec helpers (pipe, capture, double-fork)
+│   │   ├── uds.{cpp,hpp}      # Unix domain socket listen/connect/read/write
+│   │   ├── protocol.hpp       # length-prefixed SPAWN/HELLO framing
+│   │   └── engine.{cpp,hpp}   # window cache + rule dispatch (Spawner interface)
+│   ├── executor_main.cpp      # privileged socket server
+│   └── trigger_main.cpp       # event-stream watcher + UDS client
 └── third_party/
     └── nlohmann/json.hpp      # vendored single-header JSON parser
 ```

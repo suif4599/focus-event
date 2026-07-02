@@ -16,7 +16,6 @@ nixpkgsSrc.lib.nixosSystem {
 
       services.focus-event = {
         enable = true;
-        allowedUsers = [ "alice" ];
         rules = [
           { trigger = "focus"; app-id = "codium"; title = ".*focus-event.*";
             spawn = [ [ "pactl" "set-sink-mute" "@DEFAULT_SINK@" "1" ] ]; }

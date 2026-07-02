@@ -3,7 +3,10 @@
 # Architecture:
 #   - The privileged half (focus-event-executor) runs as a system service. It
 #     listens on a Unix domain socket and fork+execs commands sent to it by the
-#     trigger. It checks SO_PEERCRED against an optional uid allowlist.
+#     trigger. Authentication is binary-identity-based: the executor reads
+#     SO_PEERCRED to get the peer pid, resolves /proc/<pid>/exe, and only
+#     accepts the connection if the resolved path matches the trigger binary
+#     built into this Nix generation.
 #   - The user half (focus-event-trigger) is spawned by niri via
 #     `spawn-at-startup`. It inherits the user's NIRI_SOCKET / XDG_RUNTIME_DIR
 #     / PATH so it can talk to niri without any env munging.
@@ -41,13 +44,11 @@ let
   # creates and cleans up for us.
   socketPath = "/run/focus-event/sock";
 
-  # Usernames passed as repeated --allow-user args. The executor resolves them
-  # to uids via getpwnam at runtime (and re-resolves on each connection), so
-  # lazy-uid NixOS accounts work without us needing to know the uid at build
-  # time.
-  allowUserArgs = lib.concatMapStrings
-    (u: " --allow-user ${lib.escapeShellArg u}")
-    cfg.allowedUsers;
+  # Path of the trusted trigger binary, baked into the executor at service
+  # start. The store path already encodes a content hash, so comparing
+  # /proc/<pid>/exe against this is equivalent to verifying a SHA256 of the
+  # binary without needing a hashing dependency.
+  expectedTrigger = "${pkg}/bin/focus-event-trigger";
 
   # Wrapper script that the user adds to niri's spawn-at-startup. Knows the
   # --config and --socket paths so the user just types "focus-event".
@@ -93,18 +94,6 @@ in
       default = "";
       description = "Extra raw KDL appended after the generated rules.";
     };
-
-    allowedUsers = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = ''
-        Usernames whose uid is allowed to connect to the executor's socket and
-        issue spawn commands. The executor resolves usernames to uids at
-        runtime via getpwnam, so lazy-uid NixOS accounts work without issue.
-        If empty, any local user may connect (audit-logged via SO_PEERCRED).
-      '';
-      example = [ "alice" ];
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -122,7 +111,12 @@ in
         Type = "simple";
         RuntimeDirectory = "focus-event";
         RuntimeDirectoryMode = "0755";
-        ExecStart = "${pkg}/bin/focus-event-executor --socket ${socketPath} --mode 0660${allowUserArgs}";
+        ExecStart = lib.concatStringsSep " " [
+          "${pkg}/bin/focus-event-executor"
+          "--socket ${socketPath}"
+          "--mode 0666"
+          "--expected-trigger ${expectedTrigger}"
+        ];
         Restart = "on-failure";
         RestartSec = "5s";
         # No rate limit: we want to keep retrying forever across reboots /

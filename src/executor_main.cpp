@@ -3,13 +3,21 @@
 //
 // Listens on a Unix domain socket (default /run/focus-event.sock). For each
 // connecting client:
-//   1. Reads SO_PEERCRED. If a uid allowlist was configured via --allow-uid,
-//      rejects clients whose uid isn't in the list.
-//   2. Reads length-prefixed frames; parses SPAWN messages; fork+setsid+execs
-//      the argv. The child is detached so it outlives both trigger and
-//      executor (no zombie reaping needed because we double-fork).
+//   1. Reads SO_PEERCRED to get the peer's pid.
+//   2. Resolves /proc/<pid>/exe to find the binary the peer is currently
+//      running, and compares it against --expected-trigger (the store path
+//      of the trusted trigger binary).
+//   3. Only if the binaries match does it read frames and act on them.
 //
-// Hello messages are accepted but currently only logged.
+// Why binary-identity rather than uid-allowlist:
+//   - The trigger is the only program that should ever issue spawn commands.
+//     Authorising by binary identity ties trust to the actual code, not to
+//     whichever user happens to run it.
+//   - The expected path lives in /nix/store, whose prefix already encodes a
+//     content hash, so this is equivalent to verifying a SHA256 of the binary
+//     without needing a hashing dependency.
+//   - Any local user can connect (the socket is mode 0666 by default); only
+//     the trusted trigger binary gets past the auth check.
 //
 // The daemon is intentionally stateless: it does not load any config and does
 // not know about windows or rules. All policy lives in the trigger.
@@ -18,58 +26,37 @@
 #include "lib/uds.hpp"
 
 #include <fcntl.h>
-#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace {
 
 constexpr const char* DEFAULT_SOCKET = "/run/focus-event.sock";
-constexpr unsigned DEFAULT_MODE = 0660;
+constexpr unsigned DEFAULT_MODE = 0666;
 
 void print_usage(const char* prog) {
     std::cerr
-        << "Usage: " << prog << " [--socket PATH] [--mode MODE] [--allow-uid N | --allow-user NAME]\n"
-        << "  --socket PATH   Unix socket path (default: " << DEFAULT_SOCKET << ")\n"
-        << "  --mode MODE     Socket file mode in octal (default: " << std::oct << DEFAULT_MODE << std::dec << ")\n"
-        << "  --allow-uid N   Allow connections from this numeric uid (repeatable).\n"
-        << "  --allow-user NAME  Allow connections from this username (repeatable).\n"
-        << "                  Resolved via getpwnam at runtime, so lazy-uid systems\n"
-        << "                  (NixOS) work even if the uid wasn't assigned at build time.\n"
-        << "                  If no --allow-* is given, any local uid is allowed\n"
-        << "                  (audit-logged via SO_PEERCRED only).\n";
-}
-
-// Resolve a username to a uid via getpwnam. Returns -1 if not found.
-uid_t resolve_user(const std::string& name) {
-    struct passwd* pw = ::getpwnam(name.c_str());
-    if (!pw) return static_cast<uid_t>(-1);
-    return pw->pw_uid;
-}
-
-// Build a snapshot of all allowed uids by resolving every --allow-user name.
-// Failed resolutions are silently skipped (the user may not exist yet) — the
-// connection attempt will simply not match those entries until they do.
-std::set<uid_t> materialize_allowed(const std::set<std::string>& user_names,
-                                    const std::set<uid_t>& explicit_uids) {
-    std::set<uid_t> out = explicit_uids;
-    for (const auto& name : user_names) {
-        uid_t u = resolve_user(name);
-        if (u != static_cast<uid_t>(-1)) out.insert(u);
-    }
-    return out;
+        << "Usage: " << prog << " --expected-trigger PATH [--socket PATH] [--mode MODE]\n"
+        << "  --expected-trigger PATH  Required. Store path of the trusted\n"
+        << "                           focus-event-trigger binary. Connections\n"
+        << "                           whose /proc/<pid>/exe doesn't resolve to\n"
+        << "                           exactly this path are rejected.\n"
+        << "  --socket PATH            Unix socket path (default: " << DEFAULT_SOCKET << ")\n"
+        << "  --mode MODE              Socket file mode in octal (default: "
+        << std::oct << DEFAULT_MODE << std::dec << ")\n"
+        << "  --insecure-no-verify     Disable binary verification. For testing\n"
+        << "                           only; never use in production.\n";
 }
 
 // Double-fork + setsid + execvp. Detached so we don't reap.
@@ -79,21 +66,17 @@ void spawn_detached(const std::vector<std::string>& argv) {
     pid_t pid = ::fork();
     if (pid < 0) return;
     if (pid > 0) {
-        // Parent: reap the immediate child quickly. The grandchild will be
-        // reparented to PID 1.
         int status = 0;
         while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
         return;
     }
 
-    // First child: become its own session, then fork again.
     if (::setsid() < 0) ::_exit(127);
 
     pid_t grand = ::fork();
     if (grand < 0) ::_exit(127);
     if (grand > 0) ::_exit(0);
 
-    // Grandchild: detach stdio and exec.
     int devnull_in = ::open("/dev/null", O_RDONLY);
     int devnull_out = ::open("/dev/null", O_WRONLY);
     if (devnull_in >= 0) { ::dup2(devnull_in, STDIN_FILENO); ::close(devnull_in); }
@@ -112,7 +95,7 @@ void spawn_detached(const std::vector<std::string>& argv) {
     ::_exit(127);
 }
 
-// Parse an octal mode like "0660" or "660". Throws on garbage.
+// Parse an octal mode like "0666" or "666". Throws on garbage.
 unsigned parse_mode(const std::string& s) {
     errno = 0;
     char* end = nullptr;
@@ -123,41 +106,57 @@ unsigned parse_mode(const std::string& s) {
     return static_cast<unsigned>(m);
 }
 
-// Settings that persist for the lifetime of the daemon. The allowed-users are
-// re-resolved per connection so that uids assigned after the daemon started
-// still work.
-struct AllowList {
-    std::set<uid_t> explicit_uids;
-    std::set<std::string> user_names;
-    bool empty() const { return explicit_uids.empty() && user_names.empty(); }
-};
-
-// Returns true if the peer's uid is allowed. If the allowlist is empty, any
-// uid is allowed (audit-logged only). Usernames are re-resolved on each call
-// so newly-created users get picked up without a daemon restart.
-bool is_allowed(const AllowList& list, uid_t peer_uid) {
-    if (list.empty()) return true;
-    if (list.explicit_uids.count(peer_uid)) return true;
-    for (const auto& name : list.user_names) {
-        uid_t u = resolve_user(name);
-        if (u != static_cast<uid_t>(-1) && u == peer_uid) return true;
-    }
-    return false;
+// Resolve /proc/<pid>/exe to its target. Returns empty string on failure
+// (process exited, no permission, /proc not mounted, etc.).
+std::string resolve_exe_path(pid_t pid) {
+    std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    char buf[PATH_MAX];
+    ssize_t n = ::readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n < 0) return {};
+    buf[n] = '\0';
+    return std::string(buf);
 }
 
-void handle_client(int cfd, const AllowList& allow) {
+struct AuthConfig {
+    std::string expected_trigger;   // path the peer's /proc/<pid>/exe must match
+    bool insecure_no_verify = false;
+};
+
+// Verify the connecting peer is running the trusted trigger binary.
+// Returns true iff /proc/<pid>/exe resolves to expected_trigger.
+bool verify_peer(const AuthConfig& auth, pid_t peer_pid, uid_t peer_uid) {
+    if (auth.insecure_no_verify) {
+        std::cerr << "executor: WARNING binary verification disabled, accepting\n";
+        return true;
+    }
+    if (auth.expected_trigger.empty()) {
+        std::cerr << "executor: no --expected-trigger configured, rejecting\n";
+        return false;
+    }
+    std::string exe = resolve_exe_path(peer_pid);
+    if (exe.empty()) {
+        std::cerr << "executor: cannot resolve /proc/" << peer_pid << "/exe, rejecting\n";
+        return false;
+    }
+    if (exe != auth.expected_trigger) {
+        std::cerr << "executor: rejecting pid " << peer_pid << " uid " << peer_uid
+                  << ": binary " << exe << " != expected " << auth.expected_trigger << "\n";
+        return false;
+    }
+    return true;
+}
+
+void handle_client(int cfd, const AuthConfig& auth) {
     auto creds = uds::peer_creds(cfd);
     if (!creds) {
         std::cerr << "executor: peer credentials unavailable, dropping\n";
         return;
     }
-    if (!is_allowed(allow, creds->uid)) {
-        std::cerr << "executor: rejecting uid " << creds->uid
-                  << " pid " << creds->pid << " (not in allowlist)\n";
+    if (!verify_peer(auth, creds->pid, creds->uid)) {
         return;
     }
-    std::cerr << "executor: client uid=" << creds->uid
-              << " pid=" << creds->pid << " connected\n";
+    std::cerr << "executor: trusted trigger pid=" << creds->pid
+              << " uid=" << creds->uid << " connected\n";
 
     std::vector<std::uint8_t> payload;
     while (uds::read_frame(cfd, payload)) {
@@ -171,8 +170,8 @@ void handle_client(int cfd, const AllowList& allow) {
             try {
                 argv = protocol::decode_spawn_payload(body, body_len);
             } catch (const std::exception& e) {
-                std::cerr << "executor: malformed spawn frame from uid "
-                          << creds->uid << ": " << e.what() << "\n";
+                std::cerr << "executor: malformed spawn frame from pid "
+                          << creds->pid << ": " << e.what() << "\n";
                 return;
             }
             if (argv.empty()) {
@@ -184,8 +183,7 @@ void handle_client(int cfd, const AllowList& allow) {
                 cmd += " ";
                 cmd += argv[i];
             }
-            std::cerr << "executor: spawn (uid=" << creds->uid << "): "
-                      << cmd << "\n";
+            std::cerr << "executor: spawn (pid=" << creds->pid << "): " << cmd << "\n";
             spawn_detached(argv);
         } else if (tag == protocol::TAG_HELLO) {
             // Body layout: uint32 label_len, then label bytes. Best-effort log.
@@ -199,14 +197,14 @@ void handle_client(int cfd, const AllowList& allow) {
                     label.assign(reinterpret_cast<const char*>(body + 4), llen);
                 }
             }
-            std::cerr << "executor: hello from uid=" << creds->uid
-                      << " pid=" << creds->pid << " label='" << label << "'\n";
+            std::cerr << "executor: hello from pid=" << creds->pid
+                      << " label='" << label << "'\n";
         } else {
             std::cerr << "executor: unknown tag " << static_cast<int>(tag)
-                      << " from uid=" << creds->uid << ", ignoring\n";
+                      << " from pid=" << creds->pid << ", ignoring\n";
         }
     }
-    std::cerr << "executor: client uid=" << creds->uid << " disconnected\n";
+    std::cerr << "executor: client pid=" << creds->pid << " disconnected\n";
 }
 
 } // namespace
@@ -214,7 +212,7 @@ void handle_client(int cfd, const AllowList& allow) {
 int main(int argc, char** argv) {
     std::string socket_path = DEFAULT_SOCKET;
     unsigned mode = DEFAULT_MODE;
-    AllowList allow;
+    AuthConfig auth;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -227,25 +225,20 @@ int main(int argc, char** argv) {
         };
         if (a == "--socket") socket_path = next();
         else if (a == "--mode") mode = parse_mode(next());
-        else if (a == "--allow-uid") {
-            errno = 0;
-            char* end = nullptr;
-            unsigned long u = std::strtoul(next().c_str(), &end, 10);
-            if (errno != 0 || end == argv[i] || *end != '\0') {
-                std::cerr << "executor: bad --allow-uid value\n";
-                return 2;
-            }
-            allow.explicit_uids.insert(static_cast<uid_t>(u));
-        }
-        else if (a == "--allow-user") {
-            allow.user_names.insert(next());
-        }
+        else if (a == "--expected-trigger") auth.expected_trigger = next();
+        else if (a == "--insecure-no-verify") auth.insecure_no_verify = true;
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
         else {
             std::cerr << "executor: unknown arg '" << a << "'\n";
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    if (!auth.insecure_no_verify && auth.expected_trigger.empty()) {
+        std::cerr << "executor: --expected-trigger PATH is required\n";
+        std::cerr << "(use --insecure-no-verify only for local testing)\n";
+        return 2;
     }
 
     int lfd = -1;
@@ -256,17 +249,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Pre-resolve usernames once for the startup log; the per-connection check
-    // re-resolves so users created after startup also work.
-    auto initial = materialize_allowed(allow.user_names, allow.explicit_uids);
     std::cerr << "executor: listening on " << socket_path
-              << " mode=" << std::oct << mode << std::dec
-              << " allowlist=" << initial.size() << " uid(s) ("
-              << allow.explicit_uids.size() << " explicit + "
-              << allow.user_names.size() << " by-name)"
-              << (allow.empty() ? " [no restriction]" : "") << "\n";
+              << " mode=" << std::oct << mode << std::dec << "\n";
+    if (auth.insecure_no_verify) {
+        std::cerr << "executor: WARNING verification disabled — any local"
+                  << " user that can connect can spawn arbitrary commands\n";
+    } else {
+        std::cerr << "executor: trusting only trigger binary at "
+                  << auth.expected_trigger << "\n";
+    }
 
-    // SIGPIPE: writing to a closed socket must not kill us.
     ::signal(SIGPIPE, SIG_IGN);
 
     while (true) {
@@ -277,7 +269,7 @@ int main(int argc, char** argv) {
             continue;
         }
         ::fcntl(cfd, F_SETFD, FD_CLOEXEC);
-        handle_client(cfd, allow);
+        handle_client(cfd, auth);
         ::close(cfd);
     }
     return 0;

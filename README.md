@@ -4,8 +4,9 @@ React to [niri](https://github.com/YaLTeR/niri) window focus changes by running
 configured commands. Built as a split daemon:
 
 - **`focus-event-executor`** — a privileged system service that listens on a
-  Unix domain socket and fork+execs commands. Validates each connecting peer
-  via `SO_PEERCRED` against an optional uid/username allowlist.
+  Unix domain socket and fork+execs commands. Authenticates each connecting
+  peer by reading `SO_PEERCRED` for the pid, resolving `/proc/<pid>/exe`, and
+  comparing it against the expected trigger binary's store path.
 - **`focus-event-trigger`** — a user-space process spawned by niri (via niri's
   `spawn-at-startup`). Reads the niri event stream, matches windows against
   the rule table, and forwards SPAWN commands to the executor over the socket.
@@ -24,18 +25,14 @@ single system service.
  │  niri                          │                 │  focus-event-executor      │
  │   └─ spawn-at-startup          │                 │   listens on               │
  │       └─ focus-event-trigger   │                 │   /run/focus-event/sock    │
- │            │                   │                 │   ↓ per conn: SO_PEERCRED  │
- │            │ event-stream      │                 │   ↓ allowlist check        │
- │            ▼                   │   UDS frames    │                            │
- │     rule engine + cache  ──────┼─────────────────┼─► SPAWN argv → fork+setsid │
- │            │                   │                 │   ↓                        │
- │            ▼ config (KDL)      │                 │   privileged command runs │
+ │            │                   │                 │   ↓ per conn:              │
+ │            │ event-stream      │                 │     SO_PEERCRED → pid      │
+ │            ▼                   │   UDS frames    │     /proc/<pid>/exe        │
+ │     rule engine + cache  ──────┼─────────────────┼─►   == expected-trigger?   │
+ │            │                   │                 │   ↓ if match:              │
+ │            ▼ config (KDL)      │                 │     SPAWN argv → fork+setsid│
  └────────────────────────────────┘                 └────────────────────────────┘
 ```
-
-The protocol is length-prefixed binary frames over a Unix domain socket. See
-[src/lib/protocol.hpp](src/lib/protocol.hpp). Two tags exist: `h` (hello, so
-the executor's logs read nicer) and `s` (spawn — argc + length-prefixed argv).
 
 ## Quick start (NixOS)
 
@@ -53,7 +50,6 @@ Add the flake and enable the module:
         {
           services.focus-event = {
             enable = true;
-            allowedUsers = [ "alice" ];
             rules = [
               {
                 trigger = "focus";
@@ -98,7 +94,6 @@ That's the entire user-facing surface. The module:
 | `enable` | bool | `false` | Enable the executor service and install the trigger wrapper. |
 | `rules` | list of submodule | `[]` | Structured rules → rendered into the KDL config the trigger reads. |
 | `extraConfig` | lines | `""` | Raw KDL appended after the generated rules (escape hatch). |
-| `allowedUsers` | list of str | `[]` | Usernames allowed to connect to the executor. Resolved at runtime via `getpwnam`, so lazy-uid NixOS accounts work. Empty = allow any local uid (audit-logged via `SO_PEERCRED` only). |
 
 Each rule submodule:
 
@@ -118,22 +113,35 @@ losing focus; `on-focus` fires against the window gaining focus.
 
 ## Security model
 
-- **Socket perms.** The executor creates the socket with mode `0660` and
-  group `root` (configurable via `--mode`). Only users with write access can
-  even attempt a connection.
-- **`SO_PEERCRED`.** On each accepted connection, the executor reads the
-  kernel-verified `{pid, uid, gid}` of the peer. If `--allow-uid N` or
-  `--allow-user NAME` was given (repeatable), connections whose uid isn't in
-  the resolved set are dropped before any frame is read. Usernames are
-  re-resolved via `getpwnam` on each connection so newly-created users work
-  without restarting the executor.
-- **Defense in depth.** The NixOS module wires `allowedUsers` into
-  `--allow-user`, but the underlying socket file mode (`0660`) is the first
-  gate. Set `allowedUsers = [ "alice" ]` for a single-user workstation; leave
-  it empty for a fully-trust-the-socket-perms setup.
+Authentication is **binary-identity based**, not user based:
 
-If a peer is rejected, the executor logs `executor: rejecting uid N pid P
-(not in allowlist)` and closes the connection without reading any frames.
+1. **Nix store path = content hash.** When the executor starts, it's given an
+   `--expected-trigger PATH` argument pointing at the trigger binary inside
+   the nix store — e.g. `/nix/store/<hash>-focus-event-0.2.0/bin/focus-event-trigger`.
+   The `<hash>` prefix is a content-addressable hash of the build inputs, so
+   matching this path is equivalent to verifying a SHA256 of the binary
+   itself.
+2. **`SO_PEERCRED` + `/proc/<pid>/exe`.** On every accepted connection the
+   executor reads the kernel-verified peer pid, resolves
+   `/proc/<pid>/exe` (a symlink the kernel maintains to the running binary's
+   real path), and compares. If they don't match exactly, the connection is
+   dropped before any frame is read.
+
+This means any local user can connect to the socket (mode `0666`), but only
+the actual trigger binary we built can get past authentication. A malicious
+binary at `/tmp/imposter`, even run as root, will be rejected because its
+`/proc/<pid>/exe` resolves to `/tmp/imposter` instead of the trusted store
+path.
+
+The NixOS module wires `--expected-trigger` to `${pkgs.focus-event}/bin/focus-event-trigger`,
+which Nix interpolates as the resolved store path at build time — so the
+reference is pinned to whatever binary this Nix generation produced. On
+`nixos-rebuild switch` the executor restarts with the new generation's path,
+and the old trigger (still pointing at the old store path) is silently
+rejected until the user restarts niri (which re-runs `spawn-at-startup`).
+
+For local testing without the NixOS module, the executor accepts
+`--insecure-no-verify` which disables the check entirely (and loudly warns).
 
 ## Why the split?
 
@@ -208,7 +216,8 @@ Highlights:
 
 ```sh
 nix build                              # or: cmake -B build && cmake --build build
-./result/bin/focus-event-executor --socket /tmp/fe.sock --mode 0660 --allow-user "$USER" &
+TRIGGER=$(readlink -f result/bin/focus-event-trigger)
+./result/bin/focus-event-executor --socket /tmp/fe.sock --mode 0666 --expected-trigger "$TRIGGER" &
 ./result/bin/focus-event-trigger --socket /tmp/fe.sock --config config.example.kdl
 ```
 
@@ -246,7 +255,8 @@ cmake -B build -G Ninja
 ninja -C build
 
 # Live test against your running niri session:
-./build/focus-event-executor --socket /tmp/fe.sock --mode 0660 --allow-user "$USER" &
+TRIGGER=$(readlink -f build/focus-event-trigger)
+./build/focus-event-executor --socket /tmp/fe.sock --mode 0666 --expected-trigger "$TRIGGER" &
 ./build/focus-event-trigger --socket /tmp/fe.sock --config config.example.kdl
 ```
 

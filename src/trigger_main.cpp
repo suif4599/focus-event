@@ -73,12 +73,14 @@ public:
     void spawn(const std::vector<std::string>& argv) override {
         if (!ensure_connected()) {
             std::cerr << "trigger: executor unreachable, dropping spawn of `"
-                      << (argv.empty() ? "" : argv[0]) << "`\n";
+                      << (argv.empty() ? "" : argv[0])
+                      << "` (last error: " << last_error_ << ")\n";
             return;
         }
         auto frame = protocol::encode_spawn(argv);
         if (!uds::write_all(fd_, frame.data(), frame.size())) {
-            std::cerr << "trigger: write to executor failed, closing socket\n";
+            std::cerr << "trigger: write to executor failed: "
+                      << std::strerror(errno) << ", closing socket\n";
             ::close(fd_);
             fd_ = -1;
         }
@@ -95,9 +97,11 @@ private:
         try {
             fd_ = uds::connect(socket_path_);
         } catch (const std::exception& e) {
+            last_error_ = e.what();
             fd_ = -1;
             return false;
         }
+        last_error_.clear();
         // Send hello so the executor's logs associate this connection with us.
         std::string label = "pid=" + std::to_string(::getpid());
         auto frame = protocol::encode_hello(label);
@@ -106,6 +110,7 @@ private:
     }
 
     std::string socket_path_;
+    std::string last_error_;
     int fd_ = -1;
 };
 

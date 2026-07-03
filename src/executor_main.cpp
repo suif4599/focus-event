@@ -22,6 +22,7 @@
 // The daemon is intentionally stateless: it does not load any config and does
 // not know about windows or rules. All policy lives in the trigger.
 
+#include "lib/log.hpp"
 #include "lib/protocol.hpp"
 #include "lib/uds.hpp"
 
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -136,40 +138,44 @@ std::string drain_stderr(int fd) {
 void log_outcome(pid_t pid, const PendingChild& pc, int status, const std::string& child_output) {
     bool failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 
-    // Always log a one-line outcome. We can't stay silent on success because
-    // many programs (e.g. keyd) print their actual diagnostic ("Success" or
-    // an error message) to stdout, and the spawn dispatch line above only
-    // tells you we *tried* — not what the child replied.
-    std::cerr << "executor: `" << pc.full_cmd << "` (pid " << pid << ") ";
+    // Outcome line. We always compute it (cheap) and route to ERROR on
+    // failure or INFO on success — so default (error) logging shows only
+    // the failed spawns, while bumping the level reveals successful ones.
+    std::ostringstream status_line;
+    status_line << "executor: `" << pc.full_cmd << "` (pid " << pid << ") ";
     if (WIFEXITED(status)) {
-        std::cerr << "exited " << WEXITSTATUS(status);
+        status_line << "exited " << WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
-        std::cerr << "killed by signal " << WTERMSIG(status)
-                  << " (" << ::strsignal(WTERMSIG(status)) << ")";
+        status_line << "killed by signal " << WTERMSIG(status)
+                    << " (" << ::strsignal(WTERMSIG(status)) << ")";
     } else {
-        std::cerr << "unknown status " << status;
+        status_line << "unknown status " << status;
     }
-    std::cerr << "\n";
+    status_line << "\n";
+    if (failed) LOG_ERROR(status_line.str());
+    else        LOG_INFO(status_line.str());
 
-    // Print any captured child output (stdout + stderr combined). Indent
-    // embedded newlines so multi-line output stays as one logical block in
-    // the journal.
+    // Print captured child output (stdout + stderr combined). Indent any
+    // embedded newlines so multi-line output stays a clean block in the
+    // journal. Routed the same way as the status line: ERROR on failure,
+    // INFO on success.
     if (!child_output.empty()) {
         std::string trimmed = child_output;
         while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
             trimmed.pop_back();
         }
         if (!trimmed.empty()) {
-            std::cerr << "executor: output: ";
-            for (std::size_t i = 0; i < trimmed.size(); ++i) {
-                char c = trimmed[i];
-                if (c == '\n') std::cerr << "\nexecutor: output: ";
-                else std::cerr << c;
+            std::ostringstream block;
+            block << "executor: output: ";
+            for (char c : trimmed) {
+                if (c == '\n') block << "\nexecutor: output: ";
+                else block << c;
             }
-            std::cerr << "\n";
+            block << "\n";
+            if (failed) LOG_ERROR(block.str());
+            else        LOG_INFO(block.str());
         }
     }
-    (void)failed;
 }
 
 void reaper_loop(std::atomic<bool>& shutdown) {
@@ -183,7 +189,7 @@ void reaper_loop(std::atomic<bool>& shutdown) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
-            std::cerr << "executor: waitpid error: " << std::strerror(errno) << "\n";
+            LOG_ERROR("executor: waitpid error: " << std::strerror(errno) << "\n");
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
@@ -225,8 +231,8 @@ void spawn_tracked(const std::vector<std::string>& argv,
 
     int errpipe[2];
     if (::pipe2(errpipe, O_CLOEXEC) < 0) {
-        std::cerr << "executor: pipe() failed for `" << argv[0]
-                  << "`: " << std::strerror(errno) << "\n";
+        LOG_ERROR("executor: pipe() failed for `" << argv[0]
+                  << "`: " << std::strerror(errno) << "\n");
         return;
     }
 
@@ -234,8 +240,8 @@ void spawn_tracked(const std::vector<std::string>& argv,
     if (pid < 0) {
         ::close(errpipe[0]);
         ::close(errpipe[1]);
-        std::cerr << "executor: fork() failed for `" << argv[0]
-                  << "`: " << std::strerror(errno) << "\n";
+        LOG_ERROR("executor: fork() failed for `" << argv[0]
+                  << "`: " << std::strerror(errno) << "\n");
         return;
     }
 
@@ -333,21 +339,21 @@ struct AuthConfig {
 // Returns true iff /proc/<pid>/exe resolves to expected_trigger.
 bool verify_peer(const AuthConfig& auth, pid_t peer_pid, uid_t peer_uid) {
     if (auth.insecure_no_verify) {
-        std::cerr << "executor: WARNING binary verification disabled, accepting\n";
+        LOG_ERROR("executor: WARNING binary verification disabled, accepting\n");
         return true;
     }
     if (auth.expected_trigger.empty()) {
-        std::cerr << "executor: no --expected-trigger configured, rejecting\n";
+        LOG_ERROR("executor: no --expected-trigger configured, rejecting\n");
         return false;
     }
     std::string exe = resolve_exe_path(peer_pid);
     if (exe.empty()) {
-        std::cerr << "executor: cannot resolve /proc/" << peer_pid << "/exe, rejecting\n";
+        LOG_ERROR("executor: cannot resolve /proc/" << peer_pid << "/exe, rejecting\n");
         return false;
     }
     if (exe != auth.expected_trigger) {
-        std::cerr << "executor: rejecting pid " << peer_pid << " uid " << peer_uid
-                  << ": binary " << exe << " != expected " << auth.expected_trigger << "\n";
+        LOG_ERROR("executor: rejecting pid " << peer_pid << " uid " << peer_uid
+                  << ": binary " << exe << " != expected " << auth.expected_trigger << "\n");
         return false;
     }
     return true;
@@ -356,14 +362,14 @@ bool verify_peer(const AuthConfig& auth, pid_t peer_pid, uid_t peer_uid) {
 void handle_client(int cfd, const AuthConfig& auth) {
     auto creds = uds::peer_creds(cfd);
     if (!creds) {
-        std::cerr << "executor: peer credentials unavailable, dropping\n";
+        LOG_ERROR("executor: peer credentials unavailable, dropping\n");
         return;
     }
     if (!verify_peer(auth, creds->pid, creds->uid)) {
         return;
     }
-    std::cerr << "executor: trusted trigger pid=" << creds->pid
-              << " uid=" << creds->uid << " connected\n";
+    LOG_DEBUG("executor: trusted trigger pid=" << creds->pid
+              << " uid=" << creds->uid << " connected\n");
 
     // Per-connection environment snapshot. Empty until the trigger sends
     // a TAG_ENV frame; spawns issued before that fall back to the executor's
@@ -382,16 +388,16 @@ void handle_client(int cfd, const AuthConfig& auth) {
             try {
                 argv = protocol::decode_spawn_payload(body, body_len);
             } catch (const std::exception& e) {
-                std::cerr << "executor: malformed spawn frame from pid "
-                          << creds->pid << ": " << e.what() << "\n";
+                LOG_ERROR("executor: malformed spawn frame from pid "
+                          << creds->pid << ": " << e.what() << "\n");
                 return;
             }
             if (argv.empty()) {
-                std::cerr << "executor: empty spawn argv, ignoring\n";
+                LOG_ERROR("executor: empty spawn argv, ignoring\n");
                 continue;
             }
             std::string cmd = format_cmd(argv);
-            std::cerr << "executor: spawn (from pid=" << creds->pid << "): " << cmd << "\n";
+            LOG_INFO("executor: spawn (from pid=" << creds->pid << "): " << cmd << "\n");
             spawn_tracked(argv, client_env);
         } else if (tag == protocol::TAG_HELLO) {
             // Body layout: uint32 label_len, then label bytes. Best-effort log.
@@ -405,14 +411,14 @@ void handle_client(int cfd, const AuthConfig& auth) {
                     label.assign(reinterpret_cast<const char*>(body + 4), llen);
                 }
             }
-            std::cerr << "executor: hello from pid=" << creds->pid
-                      << " label='" << label << "'\n";
+            LOG_DEBUG("executor: hello from pid=" << creds->pid
+                      << " label='" << label << "'\n");
         } else if (tag == protocol::TAG_ENV) {
             try {
                 client_env = protocol::decode_env_payload(body, body_len);
             } catch (const std::exception& e) {
-                std::cerr << "executor: malformed env frame from pid "
-                          << creds->pid << ": " << e.what() << "\n";
+                LOG_ERROR("executor: malformed env frame from pid "
+                          << creds->pid << ": " << e.what() << "\n");
                 continue;
             }
             // Log a few key vars so the journal shows what spawn will use.
@@ -422,19 +428,19 @@ void handle_client(int cfd, const AuthConfig& auth) {
                 if (k == "PATH" || k == "XDG_RUNTIME_DIR" || k == "HOME" ||
                     k == "NIRI_SOCKET" || k == "DBUS_SESSION_BUS_ADDRESS" ||
                     k == "WAYLAND_DISPLAY") {
-                    std::cerr << "executor: env " << k << "=" << v << "\n";
+                    LOG_DEBUG("executor: env " << k << "=" << v << "\n");
                     ++shown;
                 }
             }
-            std::cerr << "executor: env snapshot from pid=" << creds->pid
+            LOG_DEBUG("executor: env snapshot from pid=" << creds->pid
                       << ": " << client_env.size() << " entries ("
-                      << shown << " shown)\n";
+                      << shown << " shown)\n");
         } else {
-            std::cerr << "executor: unknown tag " << static_cast<int>(tag)
-                      << " from pid=" << creds->pid << ", ignoring\n";
+            LOG_ERROR("executor: unknown tag " << static_cast<int>(tag)
+                      << " from pid=" << creds->pid << ", ignoring\n");
         }
     }
-    std::cerr << "executor: client pid=" << creds->pid << " disconnected\n";
+    LOG_DEBUG("executor: client pid=" << creds->pid << " disconnected\n");
 }
 
 } // namespace
@@ -448,7 +454,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
-                std::cerr << "executor: missing value for " << a << "\n";
+                LOG_ERROR("executor: missing value for " << a << "\n");
                 std::exit(2);
             }
             return argv[++i];
@@ -459,15 +465,15 @@ int main(int argc, char** argv) {
         else if (a == "--insecure-no-verify") auth.insecure_no_verify = true;
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
         else {
-            std::cerr << "executor: unknown arg '" << a << "'\n";
+            LOG_ERROR("executor: unknown arg '" << a << "'\n");
             print_usage(argv[0]);
             return 2;
         }
     }
 
     if (!auth.insecure_no_verify && auth.expected_trigger.empty()) {
-        std::cerr << "executor: --expected-trigger PATH is required\n";
-        std::cerr << "(use --insecure-no-verify only for local testing)\n";
+        LOG_ERROR("executor: --expected-trigger PATH is required\n"
+                  "(use --insecure-no-verify only for local testing)\n");
         return 2;
     }
 
@@ -475,26 +481,27 @@ int main(int argc, char** argv) {
     try {
         lfd = uds::listen(socket_path, mode);
     } catch (const std::exception& e) {
-        std::cerr << "executor: " << e.what() << "\n";
+        LOG_ERROR("executor: " << e.what() << "\n");
         return 1;
     }
 
-    std::cerr << "executor: listening on " << socket_path
-              << " mode=" << std::oct << mode << std::dec << "\n";
+    LOG_INFO("executor: listening on " << socket_path
+             << " mode=" << std::oct << mode << std::dec << "\n");
     if (auth.insecure_no_verify) {
-        std::cerr << "executor: WARNING verification disabled — any local"
-                  << " user that can connect can spawn arbitrary commands\n";
+        LOG_ERROR("executor: WARNING verification disabled — any local"
+                  << " user that can connect can spawn arbitrary commands\n");
     } else {
-        std::cerr << "executor: trusting only trigger binary at "
-                  << auth.expected_trigger << "\n";
+        LOG_INFO("executor: trusting only trigger binary at "
+                 << auth.expected_trigger << "\n");
     }
     // Log PATH so `execvp <binary>` failures (command not found) are
     // diagnosable from the journal alone.
     if (const char* p = std::getenv("PATH")) {
-        std::cerr << "executor: PATH=" << p << "\n";
+        LOG_DEBUG("executor: PATH=" << p << "\n");
+        (void)p;  // silence unused-variable when LOG_LEVEL < DEBUG
     } else {
-        std::cerr << "executor: PATH is unset — spawn commands by absolute path "
-                  << "or set Environment=PATH=... in the systemd unit\n";
+        LOG_ERROR("executor: PATH is unset — spawn commands by absolute path "
+                  << "or set Environment=PATH=... in the systemd unit\n");
     }
 
     ::signal(SIGPIPE, SIG_IGN);
@@ -510,7 +517,7 @@ int main(int argc, char** argv) {
         int cfd = ::accept(lfd, nullptr, nullptr);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "executor: accept: " << std::strerror(errno) << "\n";
+            LOG_ERROR("executor: accept: " << std::strerror(errno) << "\n");
             continue;
         }
         ::fcntl(cfd, F_SETFD, FD_CLOEXEC);

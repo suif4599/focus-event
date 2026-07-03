@@ -13,6 +13,7 @@
 #include "lib/config.hpp"
 #include "lib/engine.hpp"
 #include "lib/epoll.hpp"
+#include "lib/log.hpp"
 #include "lib/niri.hpp"
 #include "lib/protocol.hpp"
 #include "lib/subprocess.hpp"
@@ -94,15 +95,15 @@ public:
 
     void spawn(const std::vector<std::string>& argv) override {
         if (!ensure_connected()) {
-            std::cerr << "trigger: executor unreachable, dropping spawn of `"
+            LOG_ERROR("trigger: executor unreachable, dropping spawn of `"
                       << (argv.empty() ? "" : argv[0])
-                      << "` (last error: " << last_error_ << ")\n";
+                      << "` (last error: " << last_error_ << ")\n");
             return;
         }
         auto frame = protocol::encode_spawn(argv);
         if (!uds::write_all(fd_, frame.data(), frame.size())) {
-            std::cerr << "trigger: write to executor failed: "
-                      << std::strerror(errno) << ", closing socket\n";
+            LOG_ERROR("trigger: write to executor failed: "
+                      << std::strerror(errno) << ", closing socket\n");
             ::close(fd_);
             fd_ = -1;
         }
@@ -164,7 +165,7 @@ bool drain_lines(int fd, std::string& buf,
         if (n == 0) return false;
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-        std::cerr << "trigger: read error: " << std::strerror(errno) << "\n";
+        LOG_ERROR("trigger: read error: " << std::strerror(errno) << "\n");
         return false;
     }
 }
@@ -178,13 +179,13 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
-            if (i + 1 >= argc) { std::cerr << "missing value for " << a << "\n"; std::exit(2); }
+            if (i + 1 >= argc) { LOG_ERROR("missing value for " << a << "\n"); std::exit(2); }
             return argv[++i];
         };
         if (a == "--config") config_path = next();
         else if (a == "--socket") socket_path = next();
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
-        else { std::cerr << "unknown arg '" << a << "'\n"; print_usage(argv[0]); return 2; }
+        else { LOG_ERROR("unknown arg '" << a << "'\n"); print_usage(argv[0]); return 2; }
     }
 
     // SIGPIPE: writes to a closed executor socket must not kill us.
@@ -194,12 +195,12 @@ int main(int argc, char** argv) {
     try {
         cfg = config::load_file(config_path);
     } catch (const std::exception& e) {
-        std::cerr << "trigger: failed to load config from " << config_path
-                  << ": " << e.what() << "\n";
+        LOG_ERROR("trigger: failed to load config from " << config_path
+                  << ": " << e.what() << "\n");
         return 1;
     }
-    std::cerr << "trigger: loaded " << cfg.rules.size() << " rule(s) from "
-              << config_path << "\n";
+    LOG_INFO("trigger: loaded " << cfg.rules.size() << " rule(s) from "
+             << config_path << "\n");
 
     // Pick spawner based on whether --socket is empty. Ownership is held by
     // the unique_ptr; the bare pointer is what we hand to the engine.
@@ -209,28 +210,28 @@ int main(int argc, char** argv) {
     if (socket_path.empty()) {
         local_fallback = std::make_unique<engine::LocalSpawner>();
         spawner = local_fallback.get();
-        std::cerr << "trigger: socket path empty, spawning locally (standalone mode)\n";
+        LOG_DEBUG("trigger: socket path empty, spawning locally (standalone mode)\n");
     } else {
         remote = std::make_unique<RemoteSpawner>(socket_path);
         spawner = remote.get();
-        std::cerr << "trigger: forwarding spawns to executor at " << socket_path << "\n";
+        LOG_INFO("trigger: forwarding spawns to executor at " << socket_path << "\n");
     }
 
     engine::Engine eng(std::move(cfg), *spawner);
     try {
         eng.bootstrap();
     } catch (const std::exception& e) {
-        std::cerr << "trigger: bootstrap failed: " << e.what() << "\n";
+        LOG_ERROR("trigger: bootstrap failed: " << e.what() << "\n");
         return 1;
     }
-    std::cerr << "trigger: bootstrap ok, " << eng.cache_size() << " window(s) cached\n";
+    LOG_INFO("trigger: bootstrap ok, " << eng.cache_size() << " window(s) cached\n");
 
     subprocess::PipeResult pipe;
     try {
         pipe = subprocess::launch_pipe_stdout({"niri", "msg", "-j", "event-stream"});
     } catch (const std::exception& e) {
-        std::cerr << "trigger: failed to start `niri msg -j event-stream`: "
-                  << e.what() << "\n";
+        LOG_ERROR("trigger: failed to start `niri msg -j event-stream`: "
+                  << e.what() << "\n");
         return 1;
     }
     int flags = ::fcntl(pipe.read_fd, F_GETFL, 0);
@@ -246,7 +247,7 @@ int main(int argc, char** argv) {
             eng.handle_event(ev);
         });
         if (!ok) {
-            std::cerr << "trigger: niri event stream closed unexpectedly\n";
+            LOG_ERROR("trigger: niri event stream closed unexpectedly\n");
             stream_failed = true;
             loop.stop();
         }
@@ -254,7 +255,7 @@ int main(int argc, char** argv) {
 
     try { loop.run(); }
     catch (const std::exception& e) {
-        std::cerr << "trigger: epoll loop error: " << e.what() << "\n";
+        LOG_ERROR("trigger: epoll loop error: " << e.what() << "\n");
         ::close(pipe.read_fd);
         return 1;
     }

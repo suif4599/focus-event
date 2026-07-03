@@ -34,7 +34,17 @@ let
   # The C++ package: contains focus-event-executor and focus-event-trigger
   # binaries. Resolved via the overlay the flake installs alongside this
   # module.
-  pkg = pkgs.focus-event;
+  #
+  # When the user changes services.focus-event.logLevel, we rebuild the
+  # package with a different -DLOG_LEVEL=... so that less-verbose levels
+  # actually compile out log strings (not just filter them at runtime).
+  pkg =
+    if cfg.logLevel == "error" then
+      pkgs.focus-event
+    else
+      pkgs.focus-event.overrideAttrs (old: {
+        cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLOG_LEVEL=${cfg.logLevel}" ];
+      });
 
   # KDL config rendered from the structured `rules` option. Lives in the
   # nix store; the trigger reads it read-only.
@@ -93,6 +103,28 @@ in
       type = lib.types.lines;
       default = "";
       description = "Extra raw KDL appended after the generated rules.";
+    };
+
+    logLevel = lib.mkOption {
+      type = lib.types.enum [ "error" "info" "debug" ];
+      default = "error";
+      description = ''
+        Compile-time log level for both the executor and the trigger.
+
+        - `error` (default): only log failures — spawn commands that exited
+          non-zero (with their captured stdout/stderr), connection rejections,
+          malformed frames, IPC errors.
+        - `info`: also log normal spawn dispatch (`spawn (from pid=N): cmd`)
+          and successful exit statuses, plus the trigger's startup banner
+          (`loaded N rule(s)`, `bootstrap ok`).
+        - `debug`: also log the executor's startup config (PATH, expected
+          trigger path), per-connection lifecycle, and the env snapshot
+          forwarded by the trigger.
+
+        Changing this triggers a package rebuild because the level is a
+        compile-time gate (lower levels strip the log strings from the
+        binary entirely).
+      '';
     };
   };
 

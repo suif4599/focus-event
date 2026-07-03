@@ -63,6 +63,9 @@
       };
       nixosModules.focus-event = self.nixosModules.default;
 
+      homeManagerModules.default = import ./nix/home-manager.nix;
+      homeManagerModules.focus-event-user = self.homeManagerModules.default;
+
       devShells = forAllSystems (system:
         let pkgs = nixpkgsFor system;
         in {

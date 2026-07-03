@@ -117,6 +117,13 @@ in
           "--mode 0666"
           "--expected-trigger ${expectedTrigger}"
         ];
+        # Make sure spawned commands (keyd, pactl, etc.) are findable. NixOS
+        # already adds these to the default system PATH but we set it
+        # explicitly so the journal's `executor: PATH=...` line tells you
+        # exactly what spawn will search.
+        Environment = [
+          "PATH=/run/current-system/sw/bin:/run/wrappers/bin:/nix/var/nix/profiles/default/bin"
+        ];
         Restart = "on-failure";
         RestartSec = "5s";
         # No rate limit: we want to keep retrying forever across reboots /

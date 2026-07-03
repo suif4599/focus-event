@@ -31,13 +31,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -59,40 +64,213 @@ void print_usage(const char* prog) {
         << "                           only; never use in production.\n";
 }
 
-// Double-fork + setsid + execvp. Detached so we don't reap.
-void spawn_detached(const std::vector<std::string>& argv) {
+// ---------------------------------------------------------------------------
+// Spawn pipeline
+//
+// Each spawn:
+//   1. fork() (single fork, not double-fork — we want to know how it ended).
+//   2. Child sets up a stderr pipe, redirects stdin/stdout to /dev/null, and
+//      execvp()s the argv. If execvp fails, the child writes the errno string
+//      to the stderr pipe and exits 127.
+//   3. Parent returns immediately. The pid + argv[0] + stderr-pipe-fd are
+//      stashed in a registry.
+//   4. A dedicated reaper thread waitpid()s any child, looks up the registry,
+//      drains the stderr pipe, and logs the outcome.
+//
+// This means failures (wrong binary, can't connect to keyd socket, parse
+// error in the command, non-zero exit) all show up in the journal as
+// `executor: \`<cmd>\` (pid N) failed: ...` plus the captured stderr.
+
+struct PendingChild {
+    std::string argv0;          // for log messages
+    std::string full_cmd;       // "<argv0> <arg1> <arg2> ..." for the log line
+    int stderr_fd = -1;         // read end; closed by reaper after drain
+};
+
+std::mutex g_pending_mu;
+std::unordered_map<pid_t, PendingChild> g_pending;
+
+// Format argv as a shell-ish single-line representation, for log lines.
+std::string format_cmd(const std::vector<std::string>& argv) {
+    std::string out;
+    for (std::size_t i = 0; i < argv.size(); ++i) {
+        if (i) out += ' ';
+        bool needs_quote = argv[i].find_first_of(" \t'\"") != std::string::npos;
+        if (needs_quote) {
+            out += '\'';
+            for (char c : argv[i]) {
+                if (c == '\'') out += "'\\''";
+                else out += c;
+            }
+            out += '\'';
+        } else {
+            out += argv[i];
+        }
+    }
+    return out;
+}
+
+// Read everything available on fd (non-blocking after we set it). Returns
+// up to ~8 KiB; anything beyond is dropped to bound our memory.
+std::string drain_stderr(int fd) {
+    if (fd < 0) return {};
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    std::string out;
+    char buf[4096];
+    while (out.size() < 8192) {
+        ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            out.append(buf, static_cast<std::size_t>(n));
+        } else if (n == 0) {
+            break;
+        } else {
+            if (errno == EINTR) continue;
+            break;  // EAGAIN or any other error: stop
+        }
+    }
+    return out;
+}
+
+void log_outcome(pid_t pid, const PendingChild& pc, int status, const std::string& stderr_output) {
+    bool failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+    if (!failed) {
+        // Quiet on success — the spawn line above already told the user we
+        // dispatched it. Adding a "succeeded" line per spawn would be noise.
+        return;
+    }
+    std::cerr << "executor: `" << pc.full_cmd << "` (pid " << pid << ") failed: ";
+    if (WIFEXITED(status)) {
+        std::cerr << "exit " << WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        std::cerr << "signal " << WTERMSIG(status)
+                  << " (" << ::strsignal(WTERMSIG(status)) << ")";
+    } else {
+        std::cerr << "unknown status " << status;
+    }
+    std::cerr << "\n";
+    if (!stderr_output.empty()) {
+        // Trim trailing newlines, then indent any embedded newlines so the
+        // journal shows a clean block.
+        std::string trimmed = stderr_output;
+        while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+            trimmed.pop_back();
+        }
+        std::cerr << "executor: stderr: ";
+        for (std::size_t i = 0; i < trimmed.size(); ++i) {
+            char c = trimmed[i];
+            if (c == '\n') std::cerr << "\nexecutor: stderr: ";
+            else std::cerr << c;
+        }
+        std::cerr << "\n";
+    }
+}
+
+void reaper_loop(std::atomic<bool>& shutdown) {
+    while (!shutdown.load()) {
+        int status = 0;
+        pid_t pid = ::waitpid(-1, &status, 0);
+        if (pid < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) {
+                // No children outstanding; sleep briefly to avoid spinning.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            std::cerr << "executor: waitpid error: " << std::strerror(errno) << "\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+
+        PendingChild pc;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_pending_mu);
+            auto it = g_pending.find(pid);
+            if (it != g_pending.end()) {
+                pc = std::move(it->second);
+                g_pending.erase(it);
+                found = true;
+            }
+        }
+        if (!found) {
+            // Unknown child — shouldn't happen for our spawns, but don't crash.
+            continue;
+        }
+
+        std::string err = drain_stderr(pc.stderr_fd);
+        if (pc.stderr_fd >= 0) ::close(pc.stderr_fd);
+
+        log_outcome(pid, pc, status, err);
+    }
+}
+
+// Fork + execvp argv, capturing stderr via a pipe. Returns immediately; the
+// reaper thread will log the exit status. Best-effort: if pipe/fork fail we
+// log and return.
+void spawn_tracked(const std::vector<std::string>& argv) {
     if (argv.empty()) return;
 
-    pid_t pid = ::fork();
-    if (pid < 0) return;
-    if (pid > 0) {
-        int status = 0;
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+    int errpipe[2];
+    if (::pipe2(errpipe, O_CLOEXEC) < 0) {
+        std::cerr << "executor: pipe() failed for `" << argv[0]
+                  << "`: " << std::strerror(errno) << "\n";
         return;
     }
 
-    if (::setsid() < 0) ::_exit(127);
-
-    pid_t grand = ::fork();
-    if (grand < 0) ::_exit(127);
-    if (grand > 0) ::_exit(0);
-
-    int devnull_in = ::open("/dev/null", O_RDONLY);
-    int devnull_out = ::open("/dev/null", O_WRONLY);
-    if (devnull_in >= 0) { ::dup2(devnull_in, STDIN_FILENO); ::close(devnull_in); }
-    if (devnull_out >= 0) {
-        ::dup2(devnull_out, STDOUT_FILENO);
-        ::dup2(devnull_out, STDERR_FILENO);
-        ::close(devnull_out);
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(errpipe[0]);
+        ::close(errpipe[1]);
+        std::cerr << "executor: fork() failed for `" << argv[0]
+                  << "`: " << std::strerror(errno) << "\n";
+        return;
     }
 
-    std::vector<std::string> storage = argv;
-    std::vector<char*> ptrs;
-    ptrs.reserve(storage.size() + 1);
-    for (auto& a : storage) ptrs.push_back(a.data());
-    ptrs.push_back(nullptr);
-    ::execvp(ptrs[0], ptrs.data());
-    ::_exit(127);
+    if (pid == 0) {
+        // Child
+        ::close(errpipe[0]);
+        if (::dup2(errpipe[1], STDERR_FILENO) < 0) ::_exit(126);
+        ::close(errpipe[1]);
+
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            ::dup2(devnull, STDOUT_FILENO);
+            ::close(devnull);
+        }
+
+        // Reset signal handlers to defaults; clear any blocked signals.
+        ::signal(SIGPIPE, SIG_DFL);
+        sigset_t empty;
+        sigemptyset(&empty);
+        ::sigprocmask(SIG_SETMASK, &empty, nullptr);
+
+        std::vector<std::string> storage = argv;
+        std::vector<char*> ptrs;
+        ptrs.reserve(storage.size() + 1);
+        for (auto& a : storage) ptrs.push_back(a.data());
+        ptrs.push_back(nullptr);
+        ::execvp(ptrs[0], ptrs.data());
+
+        // execvp failed — write the reason to stderr (which is the pipe) and exit.
+        std::string err = std::string("execvp ") + argv[0] + ": " + std::strerror(errno) + "\n";
+        ssize_t w = ::write(STDERR_FILENO, err.data(), err.size());
+        (void)w;
+        ::_exit(127);
+    }
+
+    // Parent
+    ::close(errpipe[1]);
+    PendingChild pc;
+    pc.argv0 = argv[0];
+    pc.full_cmd = format_cmd(argv);
+    pc.stderr_fd = errpipe[0];
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mu);
+        g_pending[pid] = std::move(pc);
+    }
 }
 
 // Parse an octal mode like "0666" or "666". Throws on garbage.
@@ -178,13 +356,9 @@ void handle_client(int cfd, const AuthConfig& auth) {
                 std::cerr << "executor: empty spawn argv, ignoring\n";
                 continue;
             }
-            std::string cmd = argv[0];
-            for (std::size_t i = 1; i < argv.size(); ++i) {
-                cmd += " ";
-                cmd += argv[i];
-            }
-            std::cerr << "executor: spawn (pid=" << creds->pid << "): " << cmd << "\n";
-            spawn_detached(argv);
+            std::string cmd = format_cmd(argv);
+            std::cerr << "executor: spawn (from pid=" << creds->pid << "): " << cmd << "\n";
+            spawn_tracked(argv);
         } else if (tag == protocol::TAG_HELLO) {
             // Body layout: uint32 label_len, then label bytes. Best-effort log.
             std::string label;
@@ -258,8 +432,23 @@ int main(int argc, char** argv) {
         std::cerr << "executor: trusting only trigger binary at "
                   << auth.expected_trigger << "\n";
     }
+    // Log PATH so `execvp <binary>` failures (command not found) are
+    // diagnosable from the journal alone.
+    if (const char* p = std::getenv("PATH")) {
+        std::cerr << "executor: PATH=" << p << "\n";
+    } else {
+        std::cerr << "executor: PATH is unset — spawn commands by absolute path "
+                  << "or set Environment=PATH=... in the systemd unit\n";
+    }
 
     ::signal(SIGPIPE, SIG_IGN);
+
+    // Reaper thread logs exit status + stderr of every spawn. Lives for the
+    // lifetime of the daemon; no shutdown synchronization needed since the
+    // accept loop below never returns.
+    std::atomic<bool> shutdown{false};
+    std::thread reaper(reaper_loop, std::ref(shutdown));
+    reaper.detach();
 
     while (true) {
         int cfd = ::accept(lfd, nullptr, nullptr);

@@ -39,6 +39,8 @@ add_executable(focus-event-executor
     src/executor_main.cpp
 )
 target_link_libraries(focus-event-executor PRIVATE focus-event-lib)
+find_package(Threads REQUIRED)
+target_link_libraries(focus-event-executor PRIVATE Threads::Threads)
 
 # The user-space half: spawned by niri, reads config + event-stream, sends
 # SPAWN frames to the executor over UDS.

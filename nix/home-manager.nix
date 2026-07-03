@@ -9,6 +9,7 @@ let
     set -euo pipefail
 
     if [ -n "''${NIRI_SOCKET:-}" ] && [ -e "$NIRI_SOCKET" ]; then
+      sleep 2
       exec ${focusEventBin}
     fi
 
@@ -16,6 +17,7 @@ let
       SOCKET=$(ls -t "$XDG_RUNTIME_DIR"/niri.wayland-1.*.sock 2>/dev/null | head -1 || true)
       if [ -n "$SOCKET" ] && [ -e "$SOCKET" ]; then
         export NIRI_SOCKET="$SOCKET"
+        sleep 2
         exec ${focusEventBin}
       fi
       sleep 0.1

@@ -133,38 +133,43 @@ std::string drain_stderr(int fd) {
     return out;
 }
 
-void log_outcome(pid_t pid, const PendingChild& pc, int status, const std::string& stderr_output) {
+void log_outcome(pid_t pid, const PendingChild& pc, int status, const std::string& child_output) {
     bool failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
-    if (!failed) {
-        // Quiet on success — the spawn line above already told the user we
-        // dispatched it. Adding a "succeeded" line per spawn would be noise.
-        return;
-    }
-    std::cerr << "executor: `" << pc.full_cmd << "` (pid " << pid << ") failed: ";
+
+    // Always log a one-line outcome. We can't stay silent on success because
+    // many programs (e.g. keyd) print their actual diagnostic ("Success" or
+    // an error message) to stdout, and the spawn dispatch line above only
+    // tells you we *tried* — not what the child replied.
+    std::cerr << "executor: `" << pc.full_cmd << "` (pid " << pid << ") ";
     if (WIFEXITED(status)) {
-        std::cerr << "exit " << WEXITSTATUS(status);
+        std::cerr << "exited " << WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
-        std::cerr << "signal " << WTERMSIG(status)
+        std::cerr << "killed by signal " << WTERMSIG(status)
                   << " (" << ::strsignal(WTERMSIG(status)) << ")";
     } else {
         std::cerr << "unknown status " << status;
     }
     std::cerr << "\n";
-    if (!stderr_output.empty()) {
-        // Trim trailing newlines, then indent any embedded newlines so the
-        // journal shows a clean block.
-        std::string trimmed = stderr_output;
+
+    // Print any captured child output (stdout + stderr combined). Indent
+    // embedded newlines so multi-line output stays as one logical block in
+    // the journal.
+    if (!child_output.empty()) {
+        std::string trimmed = child_output;
         while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
             trimmed.pop_back();
         }
-        std::cerr << "executor: stderr: ";
-        for (std::size_t i = 0; i < trimmed.size(); ++i) {
-            char c = trimmed[i];
-            if (c == '\n') std::cerr << "\nexecutor: stderr: ";
-            else std::cerr << c;
+        if (!trimmed.empty()) {
+            std::cerr << "executor: output: ";
+            for (std::size_t i = 0; i < trimmed.size(); ++i) {
+                char c = trimmed[i];
+                if (c == '\n') std::cerr << "\nexecutor: output: ";
+                else std::cerr << c;
+            }
+            std::cerr << "\n";
         }
-        std::cerr << "\n";
     }
+    (void)failed;
 }
 
 void reaper_loop(std::atomic<bool>& shutdown) {
@@ -209,7 +214,13 @@ void reaper_loop(std::atomic<bool>& shutdown) {
 // Fork + execvp argv, capturing stderr via a pipe. Returns immediately; the
 // reaper thread will log the exit status. Best-effort: if pipe/fork fail we
 // log and return.
-void spawn_tracked(const std::vector<std::string>& argv) {
+//
+// `env` is the (key, value) list to run the child with. We replace the
+// child's environment entirely (clearenv + setenv loop) so the child sees
+// exactly what the trigger sent us — typically the user-session env, not the
+// system service's minimal env.
+void spawn_tracked(const std::vector<std::string>& argv,
+                   const std::vector<std::pair<std::string, std::string>>& env) {
     if (argv.empty()) return;
 
     int errpipe[2];
@@ -231,13 +242,17 @@ void spawn_tracked(const std::vector<std::string>& argv) {
     if (pid == 0) {
         // Child
         ::close(errpipe[0]);
+        // Capture BOTH stdout and stderr. Many tools (e.g. keyd) write their
+        // actual diagnostic — "Success" or the error message — to stdout,
+        // not stderr. Redirecting both to the same pipe means we see what
+        // the child actually said.
+        if (::dup2(errpipe[1], STDOUT_FILENO) < 0) ::_exit(126);
         if (::dup2(errpipe[1], STDERR_FILENO) < 0) ::_exit(126);
         ::close(errpipe[1]);
 
         int devnull = ::open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             ::dup2(devnull, STDIN_FILENO);
-            ::dup2(devnull, STDOUT_FILENO);
             ::close(devnull);
         }
 
@@ -246,6 +261,20 @@ void spawn_tracked(const std::vector<std::string>& argv) {
         sigset_t empty;
         sigemptyset(&empty);
         ::sigprocmask(SIG_SETMASK, &empty, nullptr);
+
+        // Replace our environment with the trigger's snapshot. Clear first
+        // so we don't leak anything inherited from the systemd unit (which
+        // could include secrets the child shouldn't see). Strip LD_* as a
+        // defense-in-depth against accidental privilege escalation via
+        // shared-library injection into a root-running child.
+        ::clearenv();
+        for (const auto& [k, v] : env) {
+            if (k == "LD_PRELOAD" || k == "LD_LIBRARY_PATH" ||
+                k.rfind("LD_", 0) == 0) {
+                continue;
+            }
+            ::setenv(k.c_str(), v.c_str(), 1);
+        }
 
         std::vector<std::string> storage = argv;
         std::vector<char*> ptrs;
@@ -336,6 +365,11 @@ void handle_client(int cfd, const AuthConfig& auth) {
     std::cerr << "executor: trusted trigger pid=" << creds->pid
               << " uid=" << creds->uid << " connected\n";
 
+    // Per-connection environment snapshot. Empty until the trigger sends
+    // a TAG_ENV frame; spawns issued before that fall back to the executor's
+    // own (systemd-minimal) env.
+    std::vector<std::pair<std::string, std::string>> client_env;
+
     std::vector<std::uint8_t> payload;
     while (uds::read_frame(cfd, payload)) {
         if (payload.empty()) continue;
@@ -358,7 +392,7 @@ void handle_client(int cfd, const AuthConfig& auth) {
             }
             std::string cmd = format_cmd(argv);
             std::cerr << "executor: spawn (from pid=" << creds->pid << "): " << cmd << "\n";
-            spawn_tracked(argv);
+            spawn_tracked(argv, client_env);
         } else if (tag == protocol::TAG_HELLO) {
             // Body layout: uint32 label_len, then label bytes. Best-effort log.
             std::string label;
@@ -373,6 +407,28 @@ void handle_client(int cfd, const AuthConfig& auth) {
             }
             std::cerr << "executor: hello from pid=" << creds->pid
                       << " label='" << label << "'\n";
+        } else if (tag == protocol::TAG_ENV) {
+            try {
+                client_env = protocol::decode_env_payload(body, body_len);
+            } catch (const std::exception& e) {
+                std::cerr << "executor: malformed env frame from pid "
+                          << creds->pid << ": " << e.what() << "\n";
+                continue;
+            }
+            // Log a few key vars so the journal shows what spawn will use.
+            // Avoid dumping the whole env — it can contain secrets.
+            std::size_t shown = 0;
+            for (const auto& [k, v] : client_env) {
+                if (k == "PATH" || k == "XDG_RUNTIME_DIR" || k == "HOME" ||
+                    k == "NIRI_SOCKET" || k == "DBUS_SESSION_BUS_ADDRESS" ||
+                    k == "WAYLAND_DISPLAY") {
+                    std::cerr << "executor: env " << k << "=" << v << "\n";
+                    ++shown;
+                }
+            }
+            std::cerr << "executor: env snapshot from pid=" << creds->pid
+                      << ": " << client_env.size() << " entries ("
+                      << shown << " shown)\n";
         } else {
             std::cerr << "executor: unknown tag " << static_cast<int>(tag)
                       << " from pid=" << creds->pid << ", ignoring\n";

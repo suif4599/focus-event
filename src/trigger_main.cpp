@@ -35,9 +35,15 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
+
+// `environ` is declared in <unistd.h> when _GNU_SOURCE is set; we declare it
+// explicitly here so we don't have to bring in _GNU_SOURCE. Must live outside
+// the anonymous namespace below so it's a true extern reference.
+extern "C" char** environ;
 
 namespace {
 
@@ -58,6 +64,22 @@ void print_usage(const char* prog) {
         << "  --config PATH   KDL config file (default: $XDG_CONFIG_HOME/focus-event/config.kdl)\n"
         << "  --socket PATH   Executor socket (default: " << DEFAULT_SOCKET << ")\n"
         << "                  Set --socket '' to run standalone (spawn locally, no executor).\n";
+}
+
+// Capture this process's environment as a list of (key, value) pairs.
+// Used to ship the trigger's env to the executor so spawn()ed commands
+// inherit the user's PATH, XDG_RUNTIME_DIR, NIRI_SOCKET, DBUS address, etc.
+// — not the system service's minimal env.
+std::vector<std::pair<std::string, std::string>> snapshot_env() {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (char** e = environ; *e; ++e) {
+        std::string entry(*e);
+        auto eq = entry.find('=');
+        if (eq != std::string::npos) {
+            out.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    }
+    return out;
 }
 
 // Spawner that forwards argv over a connected UDS to the executor.
@@ -104,8 +126,15 @@ private:
         last_error_.clear();
         // Send hello so the executor's logs associate this connection with us.
         std::string label = "pid=" + std::to_string(::getpid());
-        auto frame = protocol::encode_hello(label);
-        uds::write_all(fd_, frame.data(), frame.size());
+        auto hello = protocol::encode_hello(label);
+        uds::write_all(fd_, hello.data(), hello.size());
+
+        // Ship our environment so the executor's spawn() runs commands with
+        // our PATH / XDG_RUNTIME_DIR / NIRI_SOCKET etc., not the systemd
+        // service's minimal env. Send once per connection; env doesn't change
+        // during our lifetime.
+        auto envframe = protocol::encode_env(snapshot_env());
+        uds::write_all(fd_, envframe.data(), envframe.size());
         return fd_ >= 0;
     }
 

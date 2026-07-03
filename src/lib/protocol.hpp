@@ -36,6 +36,7 @@ namespace protocol {
 
 constexpr std::uint8_t TAG_SPAWN = 's';
 constexpr std::uint8_t TAG_HELLO = 'h';
+constexpr std::uint8_t TAG_ENV = 'e';
 
 // Append a little-endian uint32 to buf.
 inline void put_u32(std::vector<std::uint8_t>& buf, std::uint32_t v) {
@@ -80,6 +81,53 @@ inline std::vector<std::uint8_t> encode_hello(const std::string& label) {
     put_u32(frame, static_cast<std::uint32_t>(payload.size()));
     frame.insert(frame.end(), payload.begin(), payload.end());
     return frame;
+}
+
+// Serialize an env snapshot. Payload layout (after tag):
+//   Nuls-separated "KEY=VALUE" entries, terminator = empty entry (two
+//   consecutive nuls). We don't length-prefix each entry because nul is
+//   illegal inside both keys and values on Unix env.
+//
+//   payload = entry \0 entry \0 ... \0
+//   (a final extra \0 marks end-of-list)
+inline std::vector<std::uint8_t> encode_env(
+    const std::vector<std::pair<std::string, std::string>>& env) {
+    std::string body;
+    for (const auto& [k, v] : env) {
+        body += k;
+        body += '=';
+        body += v;
+        body += '\0';
+    }
+    body += '\0'; // terminator
+
+    std::vector<std::uint8_t> payload;
+    payload.push_back(TAG_ENV);
+    payload.insert(payload.end(), body.begin(), body.end());
+
+    std::vector<std::uint8_t> frame;
+    put_u32(frame, static_cast<std::uint32_t>(payload.size()));
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+}
+
+// Parse the env payload (bytes AFTER the tag) into (key, value) pairs.
+inline std::vector<std::pair<std::string, std::string>>
+decode_env_payload(const std::uint8_t* p, std::size_t n) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t start = i;
+        while (i < n && p[i] != 0) ++i;
+        if (i == start) break; // empty entry = terminator
+        std::string entry(reinterpret_cast<const char*>(p + start), i - start);
+        ++i; // consume nul
+        auto eq = entry.find('=');
+        if (eq != std::string::npos) {
+            out.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    }
+    return out;
 }
 
 // Decode the payload of a SPAWN message (i.e. the bytes AFTER the tag byte).

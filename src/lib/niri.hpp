@@ -1,8 +1,9 @@
 // Niri IPC types and helpers.
 //
-// We talk to niri via two JSON-producing subcommands of `niri msg`:
-//   - `niri msg -j event-stream`: long-running, prints one JSON event per line.
-//   - `niri msg -j windows`: one-shot, returns the full window list as a JSON array.
+// We talk to niri directly over its IPC socket ($NIRI_SOCKET): one request
+// encoded as a single-line JSON string ("EventStream", "Windows",
+// "FocusedWindow"), one reply per line wrapped as {"Ok":...}/{"Err":"..."}.
+// After an "EventStream" request niri keeps streaming one JSON event per line.
 //
 // The Window struct mirrors the fields we actually use; unknown fields are ignored.
 // Event types are kept minimal: only the ones we react to are modeled precisely.
@@ -52,11 +53,21 @@ struct Event {
     std::vector<Window> windows;
 };
 
-// Parse a single line of `niri msg -j event-stream` output.
+// Parse a single line of the niri event stream.
 // Returns Event::Unknown (with the raw tag) for event types we don't model.
 Event parse_event(std::string_view line);
 
-// Parse the output of `niri msg -j windows` (a JSON array of window objects).
-std::vector<Window> parse_windows(std::string_view json);
+// Parse a "Windows" reply line: {"Ok":{"Windows":[...]}}. Throws
+// std::runtime_error on {"Err":...}, malformed JSON, or a wrong shape.
+std::vector<Window> parse_windows_reply(std::string_view line);
+
+// Parse a "FocusedWindow" reply line: {"Ok":{"FocusedWindow":null|{...}}}.
+// nullopt means niri reports no focused window. Throws on {"Err":...} or a
+// wrong shape.
+std::optional<Window> parse_focused_window_reply(std::string_view line);
+
+// Validate an "EventStream" handshake reply: {"Ok":"Handled"}. Throws on
+// {"Err":...} or anything else.
+void expect_handled_reply(std::string_view line);
 
 } // namespace niri

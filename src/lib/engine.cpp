@@ -1,5 +1,7 @@
 #include "engine.hpp"
 
+#include "log.hpp"
+#include "niri_socket.hpp"
 #include "subprocess.hpp"
 
 #include <iostream>
@@ -15,8 +17,8 @@ void LocalSpawner::spawn(const std::vector<std::string>& argv) {
 
 namespace {
 
-std::vector<std::string> niri_windows_argv() {
-    return {"niri", "msg", "-j", "windows"};
+std::string id_str(std::optional<uint64_t> id) {
+    return id ? std::to_string(*id) : std::string("none");
 }
 
 } // namespace
@@ -35,18 +37,11 @@ void Engine::bootstrap() {
 }
 
 void Engine::refresh_from_niri() {
-    std::string out;
-    try {
-        out = subprocess::run_capture_stdout(niri_windows_argv());
-    } catch (const std::exception& e) {
-        std::cerr << "focus-event: refresh_from_niri failed: " << e.what() << "\n";
-        return;
-    }
     std::vector<niri::Window> ws;
     try {
-        ws = niri::parse_windows(out);
+        ws = niri_socket::query_windows();
     } catch (const std::exception& e) {
-        std::cerr << "focus-event: parse_windows failed: " << e.what() << "\n";
+        std::cerr << "focus-event: refresh_from_niri failed: " << e.what() << "\n";
         return;
     }
     cache_.clear();
@@ -74,10 +69,45 @@ void Engine::fire_rules(config::Trigger t, const niri::Window& w) {
     }
 }
 
+void Engine::set_focus(std::optional<uint64_t> new_id) {
+    std::optional<uint64_t> old_id = last_focused_id_;
+    if (old_id == new_id) return;
+    LOG_DEBUG("focus-event: focus " << id_str(old_id) << " -> " << id_str(new_id) << "\n");
+    if (old_id) {
+        auto prev = resolve(*old_id);
+        if (prev) fire_rules(config::Trigger::Blur, *prev);
+    }
+    if (new_id) {
+        auto cur = resolve(*new_id);
+        if (cur) fire_rules(config::Trigger::Focus, *cur);
+    }
+    last_focused_id_ = new_id;
+}
+
+void Engine::reconcile_focus() {
+    std::optional<niri::Window> w;
+    try {
+        w = niri_socket::query_focused_window();
+    } catch (const std::exception& e) {
+        LOG_ERROR("focus-event: focus reconcile query failed: " << e.what() << "\n");
+        return;
+    }
+    LOG_DEBUG("focus-event: reconcile: niri reports focused "
+              << id_str(w ? std::optional<uint64_t>(w->id) : std::nullopt) << "\n");
+    set_focus(w ? std::optional<uint64_t>(w->id) : std::nullopt);
+}
+
 void Engine::handle_event(const niri::Event& ev) {
     switch (ev.kind) {
         case niri::Event::WindowOpenedOrChanged: {
-            if (ev.window) cache_[ev.window->id] = *ev.window;
+            if (ev.window) {
+                cache_[ev.window->id] = *ev.window;
+                // niri's diff loop returns early for new/changed windows, which
+                // swallows the WindowFocusChanged for a window that gained
+                // focus while opening or changing; the payload still carries
+                // authoritative focus, so derive the transition here.
+                if (ev.window->is_focused) set_focus(ev.window->id);
+            }
             break;
         }
         case niri::Event::WindowClosed: {
@@ -90,21 +120,20 @@ void Engine::handle_event(const niri::Event& ev) {
         case niri::Event::WindowsChanged: {
             cache_.clear();
             for (const auto& w : ev.windows) cache_[w.id] = w;
+            // The full snapshot is authoritative (niri's mirror keeps at most
+            // one focused window), including "no focused window".
+            std::optional<uint64_t> focused;
+            for (const auto& w : ev.windows) {
+                if (w.is_focused) {
+                    focused = w.id;
+                    break;
+                }
+            }
+            set_focus(focused);
             break;
         }
         case niri::Event::WindowFocusChanged: {
-            std::optional<uint64_t> new_id = ev.focused_id;
-            std::optional<uint64_t> old_id = last_focused_id_;
-            if (old_id == new_id) break;
-            if (old_id) {
-                auto prev = resolve(*old_id);
-                if (prev) fire_rules(config::Trigger::Blur, *prev);
-            }
-            if (new_id) {
-                auto cur = resolve(*new_id);
-                if (cur) fire_rules(config::Trigger::Focus, *cur);
-            }
-            last_focused_id_ = new_id;
+            set_focus(ev.focused_id);
             break;
         }
         case niri::Event::Unknown:

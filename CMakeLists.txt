@@ -38,11 +38,13 @@ add_compile_options(
 )
 
 # Shared static library with all the engine internals: KDL parser, niri JSON
-# codec, epoll wrapper, subprocess helpers, UDS framing, rule engine.
+# codec, niri socket client, epoll wrapper, subprocess helpers, UDS framing,
+# rule engine.
 add_library(focus-event-lib STATIC
     src/lib/kdl.cpp
     src/lib/config.cpp
     src/lib/niri.cpp
+    src/lib/niri_socket.cpp
     src/lib/epoll.cpp
     src/lib/subprocess.cpp
     src/lib/uds.cpp

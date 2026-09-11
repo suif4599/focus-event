@@ -24,16 +24,58 @@ Window window_from_json(const json& j) {
     return w;
 }
 
+// Unwrap a niri reply: {"Ok":payload} / {"Err":"msg"}. Returns the Ok payload
+// on success; throws std::runtime_error carrying the Err message otherwise.
+const json& unwrap_reply(const json& j) {
+    if (!j.is_object() || j.size() != 1 || !j.contains("Ok")) {
+        if (j.is_object() && j.contains("Err") && j["Err"].is_string()) {
+            throw std::runtime_error("niri replied error: " + j["Err"].get<std::string>());
+        }
+        throw std::runtime_error("unexpected niri reply shape");
+    }
+    return j["Ok"];
+}
+
+json parse_line_json(std::string_view line) {
+    return json::parse(line, nullptr, true, true);
+}
+
 } // namespace
 
-std::vector<Window> parse_windows(std::string_view text) {
+std::vector<Window> parse_windows_reply(std::string_view line) {
+    json j = parse_line_json(line);
+    const json& payload = unwrap_reply(j);
+    if (!payload.is_object() || !payload.contains("Windows") || !payload["Windows"].is_array()) {
+        throw std::runtime_error("malformed Windows reply: expected {\"Ok\":{\"Windows\":[...]}}");
+    }
     std::vector<Window> out;
-    if (text.empty()) return out;
-    json j = json::parse(text, nullptr, true, true);
-    if (!j.is_array()) throw std::runtime_error("`niri msg -j windows` returned non-array JSON");
-    out.reserve(j.size());
-    for (const auto& w : j) out.push_back(window_from_json(w));
+    const auto& arr = payload["Windows"];
+    out.reserve(arr.size());
+    for (const auto& w : arr) out.push_back(window_from_json(w));
     return out;
+}
+
+std::optional<Window> parse_focused_window_reply(std::string_view line) {
+    json j = parse_line_json(line);
+    const json& payload = unwrap_reply(j);
+    if (!payload.is_object() || !payload.contains("FocusedWindow")) {
+        throw std::runtime_error(
+            "malformed FocusedWindow reply: expected {\"Ok\":{\"FocusedWindow\":null|{...}}}");
+    }
+    const json& w = payload["FocusedWindow"];
+    if (w.is_null()) return std::nullopt;
+    if (!w.is_object()) {
+        throw std::runtime_error("malformed FocusedWindow reply: window is neither null nor object");
+    }
+    return window_from_json(w);
+}
+
+void expect_handled_reply(std::string_view line) {
+    json j = parse_line_json(line);
+    const json& payload = unwrap_reply(j);
+    if (!payload.is_string() || payload.get<std::string>() != "Handled") {
+        throw std::runtime_error("unexpected EventStream reply: expected {\"Ok\":\"Handled\"}");
+    }
 }
 
 Event parse_event(std::string_view line) {

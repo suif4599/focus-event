@@ -7,8 +7,9 @@
 //
 // Lifecycle:
 //   Engine eng(cfg, spawner);
-//   eng.bootstrap();                 // call `niri msg -j windows` once at startup
+//   eng.bootstrap();                 // query niri for the window list once at startup
 //   eng.handle_event(ev);            // for each event from the stream
+//   eng.reconcile_focus();           // after event bursts, re-check the focused window
 
 #pragma once
 
@@ -42,17 +43,28 @@ public:
     // Spawner reference must outlive the engine.
     Engine(config::Config cfg, Spawner& spawner);
 
-    // Populate the cache from `niri msg -j windows`. Throws on failure.
+    // Populate the cache by querying niri over $NIRI_SOCKET. Throws on failure.
     void bootstrap();
 
-    // Process one event from the stream. May synchronously call `niri msg -j
-    // windows` if a referenced window id is missing from the cache.
+    // Process one event from the stream. May synchronously query niri for the
+    // full window list if a referenced window id is missing from the cache.
     void handle_event(const niri::Event& ev);
+
+    // Ask niri for the currently focused window and apply it via set_focus().
+    // Safety net for focus transitions niri's diff loop swallowed; failures
+    // are logged, never fatal.
+    void reconcile_focus();
 
     // For diagnostics: current size of the window cache.
     std::size_t cache_size() const { return cache_.size(); }
 
 private:
+    // Apply a focus transition (Blur on the old window, Focus on the new one).
+    // Idempotent: returns immediately when the focus is unchanged, so every
+    // source (WindowFocusChanged, is_focused derivation, reconcile) can call
+    // it without double-firing rules.
+    void set_focus(std::optional<uint64_t> new_id);
+
     // Resolve a window id to its info. Returns nullopt if unknown AND we can't
     // refresh. Triggers a full cache refresh on miss.
     std::optional<niri::Window> resolve(uint64_t id);

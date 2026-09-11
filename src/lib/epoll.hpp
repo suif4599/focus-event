@@ -1,6 +1,6 @@
-// Thin epoll wrapper. The loop drives a single fd (the stdout of `niri msg`).
-// Subscribers receive a callback whenever the fd is readable; they own their
-// own read buffer.
+// Thin epoll wrapper. The loop drives the niri IPC event stream fd and the
+// settle timerfd. Subscribers receive a callback whenever the fd is readable;
+// they own their own read buffer.
 
 #pragma once
 

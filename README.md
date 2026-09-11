@@ -7,9 +7,7 @@ configured commands. Built as a split daemon:
   Unix domain socket and fork+execs commands. Authenticates each connecting
   peer by reading `SO_PEERCRED` for the pid, resolving `/proc/<pid>/exe`, and
   comparing it against the expected trigger binary's store path.
-- **`focus-event-trigger`** — a user-space process spawned by niri (via niri's
-  `spawn-at-startup`). Reads the niri event stream, matches windows against
-  the rule table, and forwards SPAWN commands to the executor over the socket.
+- **`focus-event-trigger`** — a user-space process spawned by niri (via niri's `spawn-at-startup`). Talks to niri's IPC socket (`$NIRI_SOCKET`) directly for the event stream and one-shot queries, matches windows against the rule table, and forwards SPAWN commands to the executor over the socket.
 
 The split lets focus changes drive privileged actions (e.g. `keyd`, system
 `pactl`) without ever running the rule engine as root. The trigger inherits
@@ -26,7 +24,7 @@ single system service.
  │   └─ spawn-at-startup          │                 │   listens on               │
  │       └─ focus-event-trigger   │                 │   /run/focus-event/sock    │
  │            │                   │                 │   ↓ per conn:              │
- │            │ event-stream      │                 │     SO_PEERCRED → pid      │
+ │            │ IPC socket events │                 │     SO_PEERCRED → pid      │
  │            ▼                   │   UDS frames    │     /proc/<pid>/exe        │
  │     rule engine + cache  ──────┼─────────────────┼─►   == expected-trigger?   │
  │            │                   │                 │   ↓ if match:              │
@@ -168,14 +166,14 @@ The split eliminates all of that:
 
 ```
                 ┌──────────────────┐
-                │ niri msg -j      │
-                │ event-stream     │  (long-running subprocess)
+                │ niri IPC socket  │
+                │ ($NIRI_SOCKET)   │  (persistent connection)
                 └────────┬─────────┘
-                         │ stdout pipe, one JSON line per event
+                         │ one JSON line per event
                          ▼
-              ┌──────────────────────┐
-              │  epoll_wait (loop)   │  no polling, no threads
-              └────────┬─────────────┘
+              ┌──────────────────────┐   settle timerfd (one-shot, armed per
+              │  epoll_wait (loop)   │   event line): when a burst settles,
+              └────────┬─────────────┘   re-query the focused window once
                        │
                        ▼
               ┌──────────────────────┐    on cache miss for an id
@@ -185,8 +183,8 @@ The split eliminates all of that:
                        │                                            │
                        ▼                                            ▼
               ┌──────────────────────┐               ┌────────────────────────┐
-              │  window cache        │ ◄──────────── │ niri msg -j windows    │
-              │  (unordered_map)     │   full rebuild│ (one-shot subprocess)  │
+              │  window cache        │ ◄──────────── │ niri IPC socket        │
+              │  (unordered_map)     │   full rebuild│ (one-shot Windows query)│
               └────────┬─────────────┘               └────────────────────────┘
                        │
                        ▼
@@ -202,15 +200,10 @@ The split eliminates all of that:
 
 Highlights:
 
-- **No polling.** A single `epoll_wait` blocks until the niri event-stream
-  emits a line.
-- **Cheap focus changes.** The window cache is maintained incrementally from
-  `WindowOpenedOrChanged` / `WindowClosed`. A full `niri msg -j windows`
-  refresh happens only on a cache miss (typically never after bootstrap).
-- **Debouncing.** Repeated `WindowFocusChanged` events with the same id
-  (common around overview open/close) are coalesced.
-- **Reconnect.** If the executor restarts, the trigger transparently
-  reconnects on the next spawn attempt.
+- **No polling, no idle wakeups.** A single `epoll_wait` blocks until the niri event stream emits a line; the settle timer is armed only by events and never ticks while idle.
+- **Cheap focus changes.** The window cache is maintained incrementally from `WindowOpenedOrChanged` / `WindowClosed`. A full `Windows` query over the IPC socket happens only on a cache miss (typically never after bootstrap).
+- **Focus tracking that survives niri's swallowed events.** niri's event stream is a diff against a mirror of what was already sent; when a window gains focus while opening or while its title/app-id/workspace changes, the `WindowFocusChanged` push is skipped (niri issue #1889). The trigger therefore derives transitions from `WindowFocusChanged` *and* from the authoritative `is_focused` flag carried by `WindowOpenedOrChanged` / `WindowsChanged`, all funneled through one idempotent `set_focus()`. As a safety net, a trailing-edge settle reconcile (`--settle-ms`, default 250 ms, `0` disables) re-queries the focused window once after each event burst and corrects any drift.
+- **Reconnect.** If the executor restarts, the trigger transparently reconnects on the next spawn attempt.
 
 ## Bare binaries (non-NixOS)
 
@@ -224,6 +217,8 @@ TRIGGER=$(readlink -f result/bin/focus-event-trigger)
 For local development without an executor, pass `--socket ""` to the trigger
 and it will spawn commands directly (via fork+setsid+execvp) instead of
 forwarding them. Useful for iterating on the rule engine without systemd.
+
+The trigger talks to niri directly over `$NIRI_SOCKET` (no `niri msg` subprocesses). `--settle-ms N` tunes the post-burst reconcile delay (default 250, `0` disables); the NixOS wrapper passes extra arguments through, so `spawn-at-startup "focus-event" "--settle-ms" "400"` works.
 
 ## Configuration file format
 
@@ -274,7 +269,7 @@ nix eval --impure --expr 'let cfg = (import ./nix/test/eval.nix) {}; in cfg.conf
 ├── flake.nix                  # packages, overlay, nixosModules.default, lib
 ├── config.example.kdl         # hand-written example
 ├── example-events.txt         # sample event-stream lines (offline testing)
-├── example-windows.txt        # sample niri msg -j windows output
+├── example-windows.txt        # sample windows list JSON
 ├── nix/
 │   ├── lib.nix                # renderConfig: rules → KDL (pure Nix)
 │   ├── default.nix            # the NixOS module (service + package)
@@ -283,14 +278,15 @@ nix eval --impure --expr 'let cfg = (import ./nix/test/eval.nix) {}; in cfg.conf
 │   ├── lib/                   # shared static lib
 │   │   ├── kdl.{cpp,hpp}      # KDL-like parser
 │   │   ├── config.{cpp,hpp}   # rule structs + selector matcher (regex)
-│   │   ├── niri.{cpp,hpp}     # event-stream + windows JSON codec
+│   │   ├── niri.{cpp,hpp}     # event/reply JSON codec
+│   │   ├── niri_socket.{cpp,hpp} # direct $NIRI_SOCKET client (stream + queries)
 │   │   ├── epoll.{cpp,hpp}    # thin epoll wrapper
-│   │   ├── subprocess.{cpp,hpp} # fork+exec helpers (pipe, capture, double-fork)
+│   │   ├── subprocess.{cpp,hpp} # double-fork detached spawn
 │   │   ├── uds.{cpp,hpp}      # Unix domain socket listen/connect/read/write
 │   │   ├── protocol.hpp       # length-prefixed SPAWN/HELLO framing
 │   │   └── engine.{cpp,hpp}   # window cache + rule dispatch (Spawner interface)
 │   ├── executor_main.cpp      # privileged socket server
-│   └── trigger_main.cpp       # event-stream watcher + UDS client
+│   └── trigger_main.cpp       # IPC event-stream watcher + UDS client
 └── third_party/
     └── nlohmann/json.hpp      # vendored single-header JSON parser
 ```
